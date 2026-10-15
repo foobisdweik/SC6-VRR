@@ -44,7 +44,7 @@ case_file=$cases_dir/${1%.env}.env
 [[ -f $case_file ]] || { print -u2 "no such case: $case_file"; exit 1; }
 
 # Case defaults, then the case file.
-DESCRIPTION=""; LAUNCH=bundle; RETINA_SC6=unset; GAMEMODE=auto; PROFILE=0; TEST_ENV=()
+DESCRIPTION=""; LAUNCH=bundle; RETINA_SC6=unset; GAMEMODE=auto; PROFILE=0; PROFILE_WINDOW=10; PROFILE_GAP=0; PROFILE_INTERVAL_MS=1; TEST_ENV=()
 source $case_file
 
 # A running wineserver means the bottle is busy. Wine processes themselves show
@@ -204,16 +204,20 @@ done
 (( started )) && note "Game process started"
 # Record the Game Mode status once the game has had time to go fullscreen.
 ( sleep 30; [[ -x $gamepolicyctl ]] && "$gamepolicyctl" game-mode status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > $run_dir/gamemode-status.txt ) &
-# PROFILE=1: CPU samples of the game process (5 s every 30 s) with macOS
-# `sample`, to find the hot threads and functions.
+# PROFILE=1: CPU samples of the game process with macOS `sample`, in
+# back-to-back windows of PROFILE_WINDOW seconds (PROFILE_GAP seconds apart,
+# 0 = continuous), one stack snapshot every PROFILE_INTERVAL_MS milliseconds.
+# Sampling briefly suspends the process, so frame rates in these runs are a
+# little lower than in unprofiled runs.
 if (( PROFILE )); then
   (
     n=0
-    sleep 20
+    sleep 10
     while pgrep -f -q "$proc_pattern"; do
       gpid=$(ps -axo pid=,args= | awk -v pat="$proc_pattern" '$0 ~ pat && !/winewrapper/ && !/awk/ {print $1; exit}')
-      [[ -n $gpid ]] && /usr/bin/sample $gpid 5 -mayDie -file $run_dir/sample-$((++n)).txt >/dev/null 2>&1
-      sleep 25
+      [[ -n $gpid ]] && /usr/bin/sample $gpid $PROFILE_WINDOW $PROFILE_INTERVAL_MS -mayDie \
+        -file $run_dir/sample-$(printf %03d $((++n)))-$(date +%H%M%S).txt >/dev/null 2>&1
+      (( PROFILE_GAP > 0 )) && sleep $PROFILE_GAP
     done
   ) &
 fi
