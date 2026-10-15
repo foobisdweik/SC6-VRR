@@ -8,6 +8,7 @@ Valid runs (the earlier 01 runs were dry runs, cut short, or had the intro video
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 20261015-150755 | 01 | MetalFX off, Retina default (on); intro videos cut, logo cards still full length | 89 s | 380 | 54.7 | 21.2 | 17 of 67 |
 | 20261015-151518 | 04 | MetalFX 2x, Retina off for SC6, Game Mode forced on; boot cards and fades cut | 98 s | 380 | 55.0 | 4.0 | 16 of 75 |
+| 20261015-152636 | 06 | As 04, plus DXMT native fullscreen | 120 s | 382 | 55.5 | 15.3 | 15 of 84 |
 
 Findings:
 
@@ -17,3 +18,4 @@ Findings:
 4. **Presentation is "Composited"** in both runs. So the window server composites every frame, which adds latency and probably prevents ProMotion's variable refresh. Direct presentation probably needs a native fullscreen window. See the deferred item in `notes/gamemode.md`.
 5. **The cap is 60 fps,** as expected without the frame-cap DLL. The slow intervals happen during loading and menu changes. The 4 fps interval in test 04 was during the first menu load (15:15:53).
 6. **About 380 PSOs compile from a cold start** before Training. This supports the PSO archive work (`notes/dxmt.md`, item 3). The DXMT log has no timestamps, so the link between compiles and slow intervals is not measured yet.
+7. **Native fullscreen works (test 06).** DXMT requested it once (state 0 -> 4) and the window stayed in its fullscreen Space (4 -> 5), with no fight from Wine. Wine passed the new size to the game: on the notched 16-inch panel the content area is below the camera, so the game renders 1728x1084 and MetalFX outputs 3456x2168. The HUD still showed "Composited" in the user's screenshot, which was taken with the menu bar revealed at the top edge. Whether it becomes "Direct" with the pointer away from the top is not confirmed yet.
