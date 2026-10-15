@@ -9,3 +9,6 @@ SoulCalibur_6_symlink
 # Ghidra project and analysis logs (large, machine-local)
 re/ghidra/
 re/logs/
+
+# Test run output (logs, caches state)
+tests/runs/
