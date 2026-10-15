@@ -1,6 +1,6 @@
 # What sets the 60 fps cap
 
-Summary: the cap is stock UE4 4.17 frame limiting. No SoulCalibur-specific code was found that sets it. The value 60 must come from engine config inside the encrypted `pakchunk0` (or from a frame-rate setting applied at startup). Which of the three stock mechanisms below is active is **not yet known**. Step 3's loader DLL will read it at runtime.
+Summary: the cap is stock UE4 4.17 frame limiting, set by the game's config. `SoulcaliburVI/Config/DefaultEngine.ini` in `pakchunk0` sets `bUseFixedFrameRate=True` and `FixedFrameRate=60.000000` under `[/Script/Engine.Engine]` (verified 2026-10-15 by extracting the pak). No SoulCalibur-specific code sets the cap.
 
 Exe: SHA-256 `f8904e4b…a553`. Addresses are absolute (image base `0x140000000`). Found with `re/probe.sh` (headless Ghidra) and radare2 on 2026-10-15.
 
@@ -44,19 +44,27 @@ A separate path is used when `FApp::bUseFixedTimeStep` (`0x14416a944`) or `0x144
 
 No code stores 60 or 62 into `FixedFrameRate`, `FrameRateLimit`, or the smoothing upper bound. The search used `mov dword [reg+disp], imm32`.
 
-## Which mechanism is active (open)
+## Which mechanism is active (verified)
 
-The stock options that give 60 fps are:
+The pak index is encrypted (pak version 4). `repak` (v0.2.3) reads it with the AES key that the user supplied. The key is used as its first 32 ASCII bytes, in hex. The key and the extracted files are kept out of this repo.
 
-1. **`bUseFixedFrameRate=True`, `FixedFrameRate=60`.** This is what fighting games on UE4 commonly use. If it is active, every engine delta is exactly 1/60 s. That includes the UI and particle deltas that the docs call "real time".
-2. **`bSmoothFrameRate=True`** with an upper bound of 60 (or 62).
-3. **A `t.MaxFPS` / `FrameRateLimit` of 60** set somewhere other than the user's `GameUserSettings.ini`, which has `FrameRateLimit=0`.
+| File in `pakchunk0` | Setting | Effect |
+| --- | --- | --- |
+| `SoulcaliburVI/Config/DefaultEngine.ini` | `bSmoothFrameRate=False` | Smoothing is off, so `SmoothedFrameRateRange` does not apply. |
+| same | `bUseFixedFrameRate=True` | The limiter uses `FixedFrameRate`, and every engine delta is forced to `1 / FixedFrameRate`. |
+| same | `FixedFrameRate=60.000000` | The cap and the fixed delta: 60 fps, 1/60 s. |
+| same | `InitialAverageFrameRate=0.016667` | The starting value of the running average delta (1/60 s). |
+| `Engine/Config/BaseEngine.ini` | `bSmoothFrameRate=true`, range 22–62 | Stock engine default. The game file above overrides it. |
+| `SoulcaliburVI/Config/DefaultDevOnly.ini` | `+ConsoleCommands=DM.ToggleFixedFrameRate` | A developer command. The string is not in the shipping exe, so it is not available. |
 
-To decide: the loader DLL logs `GEngine+0x648` (whole word), `+0x64C`, `+0x650..+0x65F`, and the `t.MaxFPS` value once the engine is up.
+This has two consequences:
+
+1. The cap is mechanism 1. Clearing `bUseFixedFrameRate` removes it, and then `t.MaxFPS` sets the new cap.
+2. Today, every system that uses engine delta time gets exactly 1/60 s per frame. That includes UMG widgets, particles, audio, and `ALuxBattleManager::Update_Impl` timers. After the change, these systems get the measured frame time, so they keep real-time speed at any frame rate. The battle simulation does not use delta time, which is why it needs the step gate.
 
 ## How to raise the cap (for Part B)
 
-If the battle simulation is gated, the cap is no longer what keeps the game at the right speed. Whatever the active mechanism is, these steps raise the cap to 120:
+If the battle simulation is gated, the cap is no longer what keeps the game at the right speed. Because mechanism 1 is active, these steps raise the cap to 120:
 
 1. Clear `bUseFixedFrameRate` (bit `0x40` at `GEngine+0x648`). This also gives real, measured deltas to the parts of the game that use time.
 2. Set `t.MaxFPS` to 120, for example with `FrameRateLimit=120.000000` in `GameUserSettings.ini`, or through `SetMaxFPS`. Because `t.MaxFPS` replaces the smoothing result, the smoothing range does not matter.
