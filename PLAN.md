@@ -59,7 +59,7 @@ There are two independent parts.
    1. a `[/Script/Engine.Engine]` override in `Saved/Config/WindowsNoEditor/Engine.ini`,
    2. `t.MaxFPS 120` through the console exec path that still works in shipping (`SC6-docs/docs/sc6/line-batching.md`),
    3. a patch to the cap function inside the DLL.
-3. Set ProMotion pacing as the default. Put `DXMT_CONFIG=d3d11.preferredMaxFrameRate=120;` in the `Steam` bottle environment, or in a per-game `dxmt.conf` that `DXMT_CONFIG_FILE` points to. Metal then presents no faster than 120 Hz, and ProMotion lowers the refresh rate to match slower frames. This is unverified until the test in step 6.
+3. Set ProMotion pacing and MetalFX spatial upscaling as the defaults through an SC6 profile in the `dxmt-SC6` fork, and turn off Retina mode for SoulcaliburVI.exe only. See [`notes/dxmt.md`](notes/dxmt.md) for all DXMT changes. ProMotion behavior is unverified until the test in step 6.
 4. Ship an install script that writes these defaults, the DLL, and the per-app Wine override `SoulcaliburVI.exe → dinput8 = native,builtin`. The script backs up every file that it changes.
 
 ## 3. Tools

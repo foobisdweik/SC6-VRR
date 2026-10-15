@@ -25,15 +25,41 @@ From the game's `DefaultEngine.ini` and `DefaultDeviceProfiles.ini` (in `pakchun
 | Pipeline (PSO) compile | `src/d3d11/d3d11_pipeline.cpp` | Compiled on a thread pool at the first draw that needs it. The encoding thread then waits in `GetPipeline()` (`d3d11_context_impl.cpp:4841`, "may block"). With latency 1, a slow compile delays that frame's present. |
 | PSO archives | `src/winemetal/unix/winemetal_unix.c` | Render and compute PSO creation accept `MTLBinaryArchive` objects for lookup and for saving. `Metal.hpp` exposes `newBinaryArchive` and `serialize`. Nothing in `d3d11` or `dxmt` uses them. |
 
-## Ranked changes
+## Decided changes (2026-10-15)
 
-1. **SC6 app profile (small, do first).** Add `SoulcaliburVI\.exe` to `g_profiles` with `d3d11.preferredMaxFrameRate=120`. ProMotion pacing then becomes the default for this game only, with no bottle environment variables. On a 60 Hz display, the 1/120 s minimum does not limit anything, because the display is slower.
-2. **A display-sync option (small, for the step 6 test).** Add a config key (for example `dxgi.metalDisplaySync`) that sets `display_sync_enabled`. Without it, we cannot test whether `displaySyncEnabled = NO` causes tearing with VRR.
-3. **Persistent PSO archive plus warm-up (medium, likely the biggest gain in smoothness).** Pass one `MTLBinaryArchive` per game to every PSO creation, both for lookup and for saving, and save it at exit. Also record each PSO description (shader hashes and state) to disk. At the next launch, compile the recorded set on the thread pool before it is needed (like DXVK's state cache). At 120 fps the frame budget is 8.3 ms, so any compile that blocks the encoding thread for longer drops a frame. This is unverified until we measure how many PSOs compile during a match, and how long they take: `DXMT_LOG_LEVEL=trace` logs "Compiled 1 PSO".
-4. **Display-time feedback for interpolation (medium, optional).** DXMT could report each frame's actual display time (`MTLDrawable` presented handler) through a private interface. The SC6 DLL could then compute the interpolation blend from the predicted display time instead of CPU time, which may reduce judder when the refresh rate varies. Value unverified; try CPU time first.
-5. **MetalFX spatial upscaling (config only, if GPU-bound).** `DXMT_METALFX_SPATIAL_SWAPCHAIN=1` with `d3d11.metalSpatialUpscaleFactor` between 1.0 and 2.0. It fits because SC6 uses FXAA. Use it only if the step 1 baseline shows the GPU cannot reach 120 fps at native resolution.
+All changes go on a branch in `dxmt-SC6`.
 
-Not recommended: async PSO compile that skips draws until the PSO is ready. In a fighting game, a skipped draw can hide a hit effect or a character for a frame.
+1. **SC6 app profile.** Add `SoulcaliburVI\.exe` to `g_profiles` in `src/util/config/config.cpp`, with:
+   - `d3d11.preferredMaxFrameRate=120` (ProMotion pacing),
+   - the new MetalFX key from item 5,
+   - `d3d11.metalSpatialUpscaleFactor=2`.
+
+   On a 60 Hz display, the 1/120 s minimum frame time does not limit anything, because the display is slower.
+2. **Display-sync option.** Add a config key (proposed name `dxgi.metalDisplaySync`, default `False` as today) that sets `display_sync_enabled` in `dxmt_presenter.cpp`. The step 6 tearing test needs it.
+3. **Persistent PSO archive plus warm-up.**
+   1. Pass one `MTLBinaryArchive` per game to every PSO creation, both for lookup and for saving, and save it at exit.
+   2. Record each PSO description (shader hashes and state) to disk.
+   3. At the next launch, compile the recorded set on the thread pool before it is needed.
+
+   At 120 fps the frame budget is 8.3 ms. With a frame latency of 1, any compile that blocks the encoding thread for longer drops a frame. Measure first: `DXMT_LOG_LEVEL=trace` logs "Compiled 1 PSO".
+4. **Display-time feedback, behind a switch.** Add a config key (proposed `d3d11.reportPresentTiming`, default `False`). When it is on, DXMT records each frame's actual display time (`MTLDrawable` presented handler) and exposes it through a private interface on the swapchain. The SC6 DLL uses CPU time by default, and uses the display time only when it finds the interface and the switch is on.
+5. **MetalFX spatial upscaling by default.** Upstream turns it on only with the environment variable `DXMT_METALFX_SPATIAL_SWAPCHAIN=1` (`d3d11_swapchain.cpp:1124`), so a profile cannot enable it. Add a config key (proposed `d3d11.metalSpatialUpscale`) that the swapchain checks as well as the variable.
+   - Target: the game renders at 1728 × 1117 in borderless windowed mode, and MetalFX upscales by 2 to the panel's 3456 × 2234 pixels.
+   - The `Steam` bottle has `RetinaMode="y"` (`user.reg`, `[Software\\Wine\\Mac Driver]`). In that mode Wine reports the full 3456 × 2234 pixels, so the game would probably render at that size, and a 2× upscale would overshoot.
+   - So SoulcaliburVI.exe needs Retina mode off for that app only: `[Software\\Wine\\AppDefaults\\SoulcaliburVI.exe\\Mac Driver]` with `"RetinaMode"="n"`. The other games in the bottle keep the current setting.
+   - Unverified: that the Mac driver reads this per-app key, and that the layer's drawable ends up at 3456 × 2234 (the presenter multiplies the layer's `contentsScale` by the factor). Check both in step 6.
+
+Not planned: async PSO compile that skips draws until the PSO is ready. In a fighting game, a skipped draw can hide a hit effect or a character for a frame.
+
+## Upstream branches: do not merge
+
+| Branch | Commits ahead of `main` | What it changes | For SC6 |
+| --- | --- | --- | --- |
+| `dxil-dev`, `feat/dxil-1` (same content), `feat/dxil-0` | 40, 40, 21 | DXIL (D3D12 shader model 6) conversion. It also refactors the shared DXBC converter (`dxbc_converter*.cpp`, `air_operations.cpp`, signatures). | No gain, because SC6 uses D3D11 with DXBC shaders. The shared converter changes risk shader bugs and would probably invalidate the 35 MB shader cache. |
+| `feat/d2d-interop` | 2 | DXGI surface for Direct2D interop | Not used by UE4 |
+| `chore/idl` | 4 (22 behind) | D3D12 IDL and CI | Not relevant |
+
+One commit from the DXIL branches is worth considering on its own: `a584b53` "fix(airconv): fix potential leaks of `sm50_*` objects". It fixes small leaks in the DXBC converter that SC6 uses (2 files, +52/−62), and it applies cleanly to `main` (tested with `git cherry-pick --no-commit`, then reverted). The gain is small: one leaked error object per converted shader.
 
 ## Measure before changes 3–5
 
