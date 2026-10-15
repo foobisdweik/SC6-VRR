@@ -21,6 +21,8 @@ if (( ${#dxmt_logs} )); then
   print "PSO compiles finished:  $(cat $dxmt_logs | grep -c 'Compiled 1 PSO')"
   print "PSO failures:           $(cat $dxmt_logs | grep -c 'Failed to create')"
   print "MetalFX unsupported:    $(cat $dxmt_logs | grep -c 'MetalFX spatial scaler is not supported')"
+  print "Native fullscreen states (2 windowed, 3 not covering screen, 4 requested, 5 active, 6 gave up):"
+  cat $dxmt_logs | grep 'native fullscreen state' | sed 's/^/  /' | head -10
   print "Errors (first 15 unique):"
   cat $dxmt_logs | grep -E '^err:|error' | sed 's/^[^:]*: //' | sort | uniq -c | sort -rn | head -15
 fi
