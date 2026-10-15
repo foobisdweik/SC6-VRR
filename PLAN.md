@@ -6,8 +6,8 @@ Goal: SoulCalibur VI renders at up to 120 fps on the MacBook Pro's ProMotion dis
 
 | Fact | How it was checked |
 | --- | --- |
-| The exe is the build that the docs describe. SHA-256 `f8904e4b…a553`, 71,737,344 bytes. | `shasum -a 256` matches `cookbook/dotvanisher.md`. |
-| Doc addresses are valid for our exe. | The bytes at R1 `0x1403E1FEA` and R2 `0x1403E2033` are `ff 83 a4 03 00 00` (`inc dword [rbx+0x3A4]`), as `sc6/replay-system.md` says. |
+| The exe is the build that the docs describe. SHA-256 `f8904e4b…a553`, 71,737,344 bytes. | `shasum -a 256` matches `SC6-docs/docs/cookbook/dotvanisher.md`. |
+| Doc addresses are valid for our exe. | The bytes at R1 `0x1403E1FEA` and R2 `0x1403E2033` are `ff 83 a4 03 00 00` (`inc dword [rbx+0x3A4]`), as `SC6-docs/docs/sc6/replay-system.md` says. |
 | The engine is UE4 4.17.2, run through CrossOver 26.3 (bottle `Steam`) and DXMT (a Direct3D 11 to Metal translation layer). | Docs, bottle files, and the DXMT shader cache folder `dxmt/SoulcaliburVI.exe`. |
 | The user config does not set the cap. `GameUserSettings.ini` has `FrameRateLimit=0.000000` and `bUseVSync=False`. | Read from the bottle's `AppData/Local/SoulcaliburVI/Saved/Config`. |
 | The exe contains the UE4 cap settings `t.MaxFPS`, `bUseFixedFrameRate`, `FixedFrameRate`, `bSmoothFrameRate`, and `SmoothedFrameRateRange`. | UTF-16 string search of the exe. |
@@ -17,14 +17,14 @@ Goal: SoulCalibur VI renders at up to 120 fps on the MacBook Pro's ProMotion dis
 
 ### The simulation is frame-locked
 
-The docs (4 batches over 40 files) agree that one battle tick advances the game by exactly one 60 Hz frame:
+The docs in `SC6-docs/docs/` (submodule `FottenSC/SC6ModdingDocs` at `cda3eba`) agree that one battle tick advances the game by exactly one 60 Hz frame:
 
 1. `LuxBattle_PerFrameTick` (`0x1402DBC60`) runs one fixed frame per call. Velocities, decays, and move frame counters are per tick, and no engine delta time is used.
 2. The replay master clock (`InputLog+0x3A4`) increases by 1 every UE4 frame (R1/R2 above).
 3. The battle manager's catch-up loop (`0x1403FE520`) runs `master clock − last applied frame` simulation steps, and it reads one input entry per step.
 4. So if the engine renders 120 frames per second, the master clock also advances 120 times per second, and the fight runs at double speed.
 
-Some parts already use real time: UMG widgets, particles, audio, and the non-battle animation blender use UE4's `World::DeltaTime` (`sc6/movement.md:276`).
+Some parts already use real time: UMG widgets, particles, audio, and the non-battle animation blender use UE4's `World::DeltaTime` (`SC6-docs/docs/sc6/movement.md:275`).
 
 ## 2. Design
 
@@ -57,7 +57,7 @@ There are two independent parts.
 1. Find what sets the 60 cap. In Ghidra, follow the references to the cap strings into `UEngine::GetMaxTickRate`, and check for a Lux-specific limiter. The DLL logs the live `GEngine` values of `bUseFixedFrameRate`, `FixedFrameRate`, `bSmoothFrameRate`, and `SmoothedFrameRateRange`.
 2. Raise the cap to 120. Try the least invasive method first:
    1. a `[/Script/Engine.Engine]` override in `Saved/Config/WindowsNoEditor/Engine.ini`,
-   2. `t.MaxFPS 120` through the console exec path that still works in shipping (`sc6/line-batching.md`),
+   2. `t.MaxFPS 120` through the console exec path that still works in shipping (`SC6-docs/docs/sc6/line-batching.md`),
    3. a patch to the cap function inside the DLL.
 3. Set ProMotion pacing as the default. Put `DXMT_CONFIG=d3d11.preferredMaxFrameRate=120;` in the `Steam` bottle environment, or in a per-game `dxmt.conf` that `DXMT_CONFIG_FILE` points to. Metal then presents no faster than 120 Hz, and ProMotion lowers the refresh rate to match slower frames. This is unverified until the test in step 6.
 4. Ship an install script that writes these defaults, the DLL, and the per-app Wine override `SoulcaliburVI.exe → dinput8 = native,builtin`. The script backs up every file that it changes.
@@ -94,4 +94,4 @@ Not needed: UE4SS (our own small loader has fewer parts), the pak AES key (we re
 
 ## 5. Open questions
 
-1. **Docs in the public repo.** `SC6-docs/` is a copy of `FottenSC/SC6ModdingDocs/docs`, which has no license file. I suggest a git submodule that points to that repo instead of a copied folder.
+None at the moment.

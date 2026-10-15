@@ -1,3 +1,6 @@
 [submodule "third_party/minhook"]
 	path = third_party/minhook
 	url = https://github.com/TsudaKageyu/minhook.git
+[submodule "SC6-docs"]
+	path = SC6-docs
+	url = https://github.com/FottenSC/SC6ModdingDocs.git
