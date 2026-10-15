@@ -3,6 +3,7 @@
 //   strings <s1> <s2> ...  find each string as UTF-16LE and ASCII, list xrefs and their functions
 //   decomp  <addr> ...     decompile the function that contains each address
 //   xrefs   <addr> ...     list references to each address, with the containing function
+//   func    <addr> ...     print the function that contains each address
 //@category SC6
 import ghidra.app.script.GhidraScript;
 import ghidra.app.decompiler.*;
@@ -26,6 +27,7 @@ public class Probe extends GhidraScript {
                 case "strings": strings(a[i]); break;
                 case "decomp": decompile(toAddr(a[i])); break;
                 case "xrefs": xrefs(toAddr(a[i])); break;
+                case "func": out.println(a[i] + "  " + fn(toAddr(a[i]))); break;
                 default: throw new IllegalArgumentException(mode);
             }
         }
