@@ -27,6 +27,15 @@ if (( ${#dxmt_logs} )); then
   cat $dxmt_logs | grep -E '^err:|error' | sed 's/^[^:]*: //' | sort | uniq -c | sort -rn | head -15
 fi
 
+section "sc6vrr DLL (sc6vrr.log)"
+if [[ -f sc6vrr.log ]]; then
+  grep -v "frames=" sc6vrr.log | head -20
+  awk '/frames=/ { for (i=1;i<=NF;i++) { if ($i ~ /^frames=/) { split($i,a,"="); f+=a[2] } if ($i ~ /^steps=/) { split($i,b,"="); s+=b[2] } } n++ }
+       END { if (n) printf "per-second windows: %d, avg engine frames/s: %.1f, avg battle steps/s: %.1f\n", n, f/n, s/n }' sc6vrr.log
+else
+  print "no sc6vrr.log (DLL not loaded?)"
+fi
+
 section "Game process (proc.tsv)"
 awk -F'\t' 'NR>1 {n++; cpu+=$3; if ($4>rss) rss=$4; if (!first) first=$1; last=$1}
   END {if (n) printf "samples: %d (%s to %s)\navg cpu: %.0f%%\nmax rss: %.0f MB\n", n, first, last, cpu/n, rss/1024; else print "no samples"}' proc.tsv

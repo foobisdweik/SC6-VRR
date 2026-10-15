@@ -127,6 +127,7 @@ env_list=(
   "WINELOADER=$loader" "CX_WINELOADER=$loader"
   CX_GRAPHICS_BACKEND=dxmt
   DXMT_LOG_LEVEL=trace "DXMT_LOG_PATH=$dxmt_log_win"
+  "SC6VRR_LOG=Z:${run_dir//\//\\}\\sc6vrr.log"
   MTL_HUD_ENABLED=1 MTL_HUD_LOG_ENABLED=1
   $TEST_ENV
 )
