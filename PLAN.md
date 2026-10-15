@@ -80,7 +80,7 @@ Not needed: UE4SS (our own small loader has fewer parts), the pak AES key (we re
 ## 4. Steps
 
 1. **Baseline.** Run the game with the Metal HUD on. Record the fps, the present interval, and the round timer length in training mode. This gives the stock numbers to compare with.
-2. **Find the cap.** Use Ghidra on the cap strings and `GetMaxTickRate`, and record the result in `notes/`. Then the Part B method can be chosen.
+2. **Find the cap.** Done 2026-10-15; see [`notes/frame-cap.md`](notes/frame-cap.md). The cap is stock UE4 frame limiting with a config value. Step 3 must log which of the three mechanisms is active.
 3. **Loader DLL.** Build the proxy `dinput8.dll` with the hash check and logging only. This proves that it loads under CrossOver before any hook goes in.
 4. **Cap test.** Raise the cap with no gating. The fight should run fast, which confirms the frame-locked model above.
 5. **Fixed-step gating and input merge.** Add the accumulator, the gates, and the merge of input samples between steps. Done means:
