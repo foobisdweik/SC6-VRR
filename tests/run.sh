@@ -44,7 +44,7 @@ case_file=$cases_dir/${1%.env}.env
 [[ -f $case_file ]] || { print -u2 "no such case: $case_file"; exit 1; }
 
 # Case defaults, then the case file.
-DESCRIPTION=""; LAUNCH=bundle; RETINA_SC6=unset; GAMEMODE=auto; PROFILE=0; PROFILE_WINDOW=10; PROFILE_GAP=0; PROFILE_INTERVAL_MS=1; TEST_ENV=()
+DESCRIPTION=""; LAUNCH=bundle; RETINA_SC6=unset; GAMEMODE=auto; PROFILE=0; PROFILE_WINDOW=10; PROFILE_GAP=0; PROFILE_INTERVAL_MS=1; ENGINE_INI_SETTINGS=(); TEST_ENV=()
 source $case_file
 
 # A running wineserver means the bottle is busy. Wine processes themselves show
@@ -100,6 +100,42 @@ case $RETINA_SC6 in
   *) print -u2 "RETINA_SC6 must be y, n, or unset"; exit 1 ;;
 esac
 wait_for_idle_bottle
+
+# --- 1b. Per-run Engine.ini [SystemSettings] (ENGINE_INI_SETTINGS) --------------
+# UE4 reads [SystemSettings] from the user Engine.ini at startup with higher
+# priority than the in-game graphics menu. The original file is restored after
+# the run (and on any exit of this script).
+engine_ini="$HOME/Library/Application Support/CrossOver/Bottles/$bottle/drive_c/users/crossover/AppData/Local/SoulcaliburVI/Saved/Config/WindowsNoEditor/Engine.ini"
+engine_ini_backup=$run_dir/Engine.ini.orig
+restore_engine_ini() { [[ -f $engine_ini_backup ]] && cp -p $engine_ini_backup "$engine_ini" }
+if (( ${#ENGINE_INI_SETTINGS} )); then
+  cp -p "$engine_ini" $engine_ini_backup
+  python3 -I - "$engine_ini" $ENGINE_INI_SETTINGS <<'PY'
+import sys
+path, settings = sys.argv[1], sys.argv[2:]
+text = open(path, encoding="utf-8", errors="surrogateescape", newline="").read()
+nl = "\r\n" if "\r\n" in text else "\n"  # keep the file's Windows line endings
+lines = text.splitlines()
+out, in_ss, done = [], False, False
+keys = {s.split("=", 1)[0].lower() for s in settings}
+for line in lines:
+    st = line.strip()
+    if st.startswith("["):
+        if in_ss and not done:
+            out += settings; done = True
+        in_ss = st.lower() == "[systemsettings]"
+    elif in_ss and st.split("=", 1)[0].strip().lower() in keys:
+        continue  # replaced by the run's value
+    out.append(line)
+if in_ss and not done:
+    out += settings; done = True
+if not done:
+    out += ["", "[SystemSettings]"] + settings
+open(path, "w", encoding="utf-8", errors="surrogateescape", newline="").write(nl.join(out) + nl)
+PY
+  trap restore_engine_ini EXIT
+  note "Engine.ini [SystemSettings] for this run: $ENGINE_INI_SETTINGS"
+fi
 
 # --- 2. Clear SC6's shader caches ---------------------------------------------
 note "Clearing DXMT cache: $dxmt_cache"
@@ -169,7 +205,7 @@ hud_start=$(date '+%Y-%m-%d %H:%M:%S')
 pids+=$!
 stop_loggers() { kill $pids 2>/dev/null || true; wait $pids 2>/dev/null || true }
 restore_gamemode() { [[ $GAMEMODE == on ]] && "$gamepolicyctl" game-mode set auto >/dev/null 2>&1 || true }
-trap 'stop_loggers; restore_gamemode' EXIT
+trap 'stop_loggers; restore_gamemode; restore_engine_ini' EXIT
 
 if [[ $GAMEMODE == on ]]; then
   note "Forcing Game Mode on with gamepolicyctl (restored to automatic at the end)"
@@ -227,6 +263,7 @@ wait $launcher_pid 2>/dev/null || true
 wait_for_idle_bottle || true
 stop_loggers
 restore_gamemode
+restore_engine_ini
 trap - EXIT
 /usr/bin/log show --start "$hud_start" --style compact --info \
   --predicate 'process == "wineloader" AND subsystem == "com.apple.metal.hud"' > $run_dir/metal.log 2>/dev/null || true
