@@ -45,3 +45,10 @@ The launcher refuses to start if CrossOver's `wineloader` changed since the buil
 3. Whether the bundle's `NSHighResolutionCapable = true` matches the Retina setting that we need for MetalFX (`RetinaMode = n` for SoulcaliburVI.exe).
 
 Undo: delete `~/Applications/SC6-VRR/SoulCalibur VI.app`. Nothing in CrossOver or the bottle changes.
+
+## Results (2026-10-15)
+
+- **The bundle alone does not give Game Mode.** In test 01, `gamepolicyd` saw the SC6 window as a foreground app with no `CFBundleIdentifier`. So macOS never reads the bundle's game keys for the game process. The cause is unknown; Wine's loader may register the process with Launch Services without a bundle.
+- **`gamepolicyctl` works.** Xcode's `gamepolicyctl game-mode set on` (also used by NotProton PR #156) turned Game Mode on in test 04, and the Metal HUD showed Game Mode on. It needs no admin rights. `game-mode set auto` restores the normal policy.
+- **The launcher now does this.** `sc6-launch` forces Game Mode on, waits for `SoulcaliburVI.exe` to exit, then sets the policy back to automatic. Without Xcode it skips this step.
+- **Presentation stays "Composited"** (Metal HUD) even with Game Mode on. Direct presentation probably needs native fullscreen. That is the deferred item above.

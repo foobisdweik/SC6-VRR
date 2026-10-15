@@ -57,10 +57,24 @@ if [[ "\$(shasum -a 256 "\$src_loader" | cut -d' ' -f1)" != "\$(<"\$here/../Reso
   exit 1
 fi
 
-exec ${(q)cx_root}/bin/wine --bottle ${(q)bottle} \\
+# Game Mode: macOS does not link the SC6 window to this bundle (gamepolicyd sees
+# no bundle ID), so force Game Mode on with Xcode's gamepolicyctl and set it
+# back to automatic when the game exits. Skipped when Xcode is not installed.
+gamepolicyctl="\$(xcode-select -p 2>/dev/null)/usr/bin/gamepolicyctl"
+[[ -x \$gamepolicyctl ]] || gamepolicyctl=""
+[[ -n \$gamepolicyctl ]] && "\$gamepolicyctl" game-mode set on >/dev/null 2>&1
+restore() { [[ -n \$gamepolicyctl ]] && "\$gamepolicyctl" game-mode set auto >/dev/null 2>&1 }
+trap restore EXIT INT TERM
+
+${(q)cx_root}/bin/wine --bottle ${(q)bottle} \\
   --env "WINELOADER=\\"\$loader\\" CX_WINELOADER=\\"\$loader\\"" \\
   --workdir ${(q)game_exe:h} \\
-  --start ${(q)game_exe} "\$@"
+  --start ${(q)game_exe} "\$@" &
+
+# Wine shows the game process with its Windows command line, which ends in
+# SoulcaliburVI.exe. Wait up to 2 minutes for it to appear, then until it exits.
+for i in {1..120}; do pgrep -f -q 'SoulcaliburVI\\.exe' && break; sleep 1; done
+while pgrep -f -q 'SoulcaliburVI\\.exe'; do sleep 2; done
 EOF
 chmod +x "$app/Contents/MacOS/sc6-launch"
 
