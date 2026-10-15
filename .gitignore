@@ -1,0 +1,11 @@
+.DS_Store
+# Finder alias to the local game install (machine-specific)
+SoulCalibur_6_symlink
+# Game binaries and dumps never go in this repo
+*.exe
+*.pak
+*.gzf
+*.rep/
+# Ghidra project and analysis logs (large, machine-local)
+re/ghidra/
+re/logs/
