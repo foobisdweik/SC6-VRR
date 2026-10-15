@@ -79,15 +79,15 @@ Not needed: UE4SS (our own small loader has fewer parts), the pak AES key (we re
 
 ## 4. Steps
 
-1. **Baseline.** Run the game with the Metal HUD on, on CrossOver 26.3 and on CrossOver Preview 27.0 with FEX (see [`notes/dxmt.md`](notes/dxmt.md)). Record the fps, the present interval, and the round timer length in training mode. This gives the stock numbers to compare with.
+1. **Baseline.** Partly done 2026-10-15 on CrossOver 26.3 (`notes/test-results.md`); the CrossOver Preview comparison is still open. Run the game with the Metal HUD on, on CrossOver 26.3 and on CrossOver Preview 27.0 with FEX (see [`notes/dxmt.md`](notes/dxmt.md)). Record the fps, the present interval, and the round timer length in training mode. This gives the stock numbers to compare with.
 2. **Find the cap.** Done 2026-10-15; see [`notes/frame-cap.md`](notes/frame-cap.md). `DefaultEngine.ini` in the pak sets `bUseFixedFrameRate=True` and `FixedFrameRate=60`.
-3. **Loader DLL.** Build the proxy `dinput8.dll` with the hash check and logging only. This proves that it loads under CrossOver before any hook goes in.
-4. **Cap test.** Raise the cap with no gating. The fight should run fast, which confirms the frame-locked model above.
-5. **Fixed-step gating and input merge.** Add the accumulator, the gates, and the merge of input samples between steps. Done means:
+3. **Loader DLL.** Done 2026-10-15 (`dll/`, test 07). Build the proxy `dinput8.dll` with the hash check and logging only. This proves that it loads under CrossOver before any hook goes in.
+4. **Cap test.** Done 2026-10-15 (test 07: up to 120 fps, fight too fast). Raise the cap with no gating. The fight should run fast, which confirms the frame-locked model above.
+5. **Fixed-step gating and input merge.** Gating done 2026-10-15 (test 08: 120 frames, 60 steps per second, normal speed and input). The input merge is still open. Add the accumulator, the gates, and the merge of input samples between steps. Done means:
    1. `nMasterClock` and `g_LuxBattle_FrameCounter` advance by 60 per second at 120, 90, and 45 fps.
    2. A tap shorter than 16.7 ms registers at 120 fps.
    3. Motion inputs still have the same frame windows, as checked against the training-mode input display.
-6. **ProMotion default.** Apply the DXMT setting. In the Metal HUD, check that the present interval follows the frame time between 24 and 120 Hz, in both fullscreen and windowed mode.
+6. **ProMotion default.** DXMT side done 2026-10-15 (SC6 profile, native fullscreen, BGR10A2 layer gives "Direct"); the present-interval check across 24–120 Hz is still open. Apply the DXMT setting. In the Metal HUD, check that the present interval follows the frame time between 24 and 120 Hz, in both fullscreen and windowed mode.
 7. **Interpolation.** Blend render position, pose, animation frame, and camera. Done means visibly smooth 120 fps motion with no extra frame of delay.
 8. **Determinism test.** Record a replay at 120 fps and play it back with the DLL off. If the outcome is identical, the simulation did not change.
 9. **Install script and README.**
