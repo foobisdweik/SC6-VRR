@@ -36,6 +36,22 @@ else
   print "no sc6vrr.log (DLL not loaded?)"
 fi
 
+section "DXMT frame statistics (DXMT_LOG_FRAME_STATS)"
+if (( ${#dxmt_logs} )) && cat $dxmt_logs | grep -q "frame-stats:"; then
+  cat $dxmt_logs | grep "frame-stats:" | python3 -I -c '
+import sys,re
+rows=[dict((k,float(v)) for k,v in re.findall(r"(\w+)=([\d.]+)",l)) for l in sys.stdin]
+keys=["commit_avg","sync_avg","present_latency","encode_prepare","encode_flush","drawable_wait","render_passes"]
+print("samples:",len(rows))
+for k in keys:
+    v=[r[k] for r in rows if k in r]
+    if v: print(f"  {k:16s} avg {sum(v)/len(v):7.2f}  max {max(v):7.2f}")
+'
+else
+  print "none"
+fi
+ls sample-*.txt(N) | sed 's/^/CPU sample: /'
+
 section "Game process (proc.tsv)"
 awk -F'\t' 'NR>1 {n++; cpu+=$3; if ($4>rss) rss=$4; if (!first) first=$1; last=$1}
   END {if (n) printf "samples: %d (%s to %s)\navg cpu: %.0f%%\nmax rss: %.0f MB\n", n, first, last, cpu/n, rss/1024; else print "no samples"}' proc.tsv
