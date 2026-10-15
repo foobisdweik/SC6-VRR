@@ -34,9 +34,20 @@ print "lines: $(wc -l < gamepolicyd.log | tr -d ' ')"
 grep -i -E "game ?mode|GameSession|foreground|fullscreen|sc6vrr|wineloader" gamepolicyd.log | tail -15 || true
 [[ -f gamemode-status.txt ]] && { print "status during run:"; cat gamemode-status.txt }
 
-section "Metal HUD log (metal.log)"
-print "lines: $(wc -l < metal.log | tr -d ' ')"
-tail -5 metal.log
+section "Frame rate (Metal HUD frame counter, per log line)"
+# fps = change in the frame counter / change in time between HUD lines.
+awk '/metal-HUD:/ {
+    split($2, hms, ":"); t = hms[1]*3600 + hms[2]*60 + hms[3]
+    sub(/.*metal-HUD: /, ""); split($0, f, ","); n = f[1] + 0
+    if (have && t > pt && n >= pn) {
+      fps = (n - pn) / (t - pt); c++; sum += fps
+      if (!c0 || fps < mn) mn = fps; if (fps > mx) mx = fps; c0 = 1
+      if (fps < 55) low++; if (fps > 65) high++
+    }
+    pt = t; pn = n; have = 1
+  }
+  END { if (c) printf "intervals: %d\navg fps: %.1f  min: %.1f  max: %.1f\nintervals under 55 fps: %d  over 65 fps: %d\n", c, sum/c, mn, mx, low, high
+        else print "no HUD frame data" }' metal.log
 
 section "Metal cache folders written in this run"
 cat metal-cache-dirs.txt 2>/dev/null

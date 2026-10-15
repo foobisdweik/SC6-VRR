@@ -154,11 +154,9 @@ pids=()
 /usr/bin/log stream --style compact --info --debug --predicate 'process == "gamepolicyd"' \
   > $run_dir/gamepolicyd.log 2>&1 &
 pids+=$!
-# Metal Performance HUD statistics (MTL_HUD_LOG_ENABLED). Whether the HUD logs
-# under this subsystem for a Wine process is unverified.
-/usr/bin/log stream --style compact --info --predicate 'process == "wineloader" AND subsystem BEGINSWITH "com.apple.Metal"' \
-  > $run_dir/metal.log 2>&1 &
-pids+=$!
+# Metal Performance HUD statistics (MTL_HUD_LOG_ENABLED) are collected after the
+# run with `log show`; `log stream` did not deliver them (seen 2026-10-15).
+hud_start=$(date '+%Y-%m-%d %H:%M:%S')
 # Per-second CPU and memory of the game process.
 {
   print "time\tpid\tcpu_pct\trss_kb"
@@ -212,6 +210,8 @@ wait_for_idle_bottle || true
 stop_loggers
 restore_gamemode
 trap - EXIT
+/usr/bin/log show --start "$hud_start" --style compact --info \
+  --predicate 'process == "wineloader" AND subsystem == "com.apple.metal.hud"' > $run_dir/metal.log 2>/dev/null || true
 
 # --- 6. Record Metal cache folders written during the run -----------------------
 new_dirs=()

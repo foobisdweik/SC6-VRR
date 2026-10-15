@@ -12,3 +12,6 @@ re/logs/
 
 # Test run output (logs, caches state)
 tests/runs/
+
+# Built mod paks (contain game data)
+mods/build/
