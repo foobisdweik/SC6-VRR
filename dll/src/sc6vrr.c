@@ -21,17 +21,25 @@
  *
  * Settings come from environment variables (set them with `wine --env`):
  *   SC6VRR_UNCAP=1, SC6VRR_MAX_FPS=120, SC6VRR_GATE=1, SC6VRR_LOG=<Windows path>
+ *   SC6VRR_MEASURE=1 records completed battle work and elapsed function times.
+ *   SC6VRR_SHADER_DIR=<Windows path> records every shader the game creates,
+ *   its input layouts, and the shader combinations that its draws use.
+ *   SC6VRR_FRAME_MODS=1 is required for every engine hook above (uncap, gate,
+ *   measure). Without it, the DLL changes no frame timing.
  */
 #include <windows.h>
 #include <bcrypt.h>
+#include <d3d11.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include "MinHook.h"
+#include "measurements.h"
 
 /* ---------- configuration and logging ---------------------------------- */
 
-static int cfg_uncap, cfg_gate;
+static int cfg_uncap, cfg_gate, cfg_measure, cfg_frame_timers, cfg_thread_names;
 static float cfg_max_fps = 120.0f;
 static FILE *log_file;
 
@@ -44,6 +52,7 @@ static int env_int(const char *name, int fallback) {
 static void log_msg(const char *fmt, ...) {
   if (!log_file)
     return;
+  _lock_file(log_file);
   SYSTEMTIME t;
   GetLocalTime(&t);
   fprintf(log_file, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
@@ -53,6 +62,7 @@ static void log_msg(const char *fmt, ...) {
   va_end(ap);
   fputc('\n', log_file);
   fflush(log_file);
+  _unlock_file(log_file);
 }
 
 static void open_log(void) {
@@ -67,6 +77,51 @@ static void open_log(void) {
     strcpy(slash + 1, "sc6vrr.log");
   }
   log_file = fopen(path, "w");
+}
+
+/* Observe the game's legacy thread names without consuming its exception. */
+typedef HRESULT (WINAPI *set_thread_description_fn)(HANDLE, PCWSTR);
+static set_thread_description_fn set_thread_description;
+static PVOID thread_name_observer;
+
+static LONG CALLBACK observe_thread_name(EXCEPTION_POINTERS *exception) {
+  EXCEPTION_RECORD *record = exception->ExceptionRecord;
+  if (record->ExceptionCode != 0x406D1388 || record->NumberParameters != 3 ||
+      record->ExceptionInformation[0] != 0x1000 ||
+      (record->ExceptionInformation[2] >> 32) != 0)
+    return EXCEPTION_CONTINUE_SEARCH;
+  char name[64] = {0};
+  SIZE_T got = 0;
+  ReadProcessMemory(GetCurrentProcess(), (const void *)record->ExceptionInformation[1],
+                    name, sizeof(name) - 1, &got);
+  if (!got)
+    return EXCEPTION_CONTINUE_SEARCH;
+  name[got] = 0;
+  for (unsigned i = 0; name[i]; i++)
+    if ((unsigned char)name[i] < 32 || (unsigned char)name[i] > 126)
+      name[i] = '_';
+  DWORD caller = GetCurrentThreadId();
+  DWORD target = (DWORD)record->ExceptionInformation[2];
+  if (target == (DWORD)-1)
+    target = caller;
+  HRESULT result = E_NOTIMPL;
+  if (target == caller && set_thread_description) {
+    wchar_t wide[64];
+    for (unsigned i = 0; i <= strlen(name); i++)
+      wide[i] = (unsigned char)name[i];
+    result = set_thread_description(GetCurrentThread(), wide);
+  }
+  log_msg("thread_name_v=1 win_tid=%lu caller_tid=%lu hr=0x%08lx name=%s",
+          (unsigned long)target, (unsigned long)caller, (unsigned long)result, name);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void install_thread_name_observer(void) {
+  set_thread_description = (set_thread_description_fn)GetProcAddress(
+      GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
+  thread_name_observer = AddVectoredExceptionHandler(1, observe_thread_name);
+  log_msg("thread names: observer=%s native_naming=%s; original exception handling is preserved",
+          thread_name_observer ? "enabled" : "failed", set_thread_description ? "available" : "unavailable");
 }
 
 /* ---------- exe identity ------------------------------------------------- */
@@ -134,6 +189,13 @@ static const uint64_t kClockIncs[] = {0x1403E1FEA /* R1+0x2A */, 0x1403E2033 /* 
 #define ADDR_UPDATE_TIME       0x142189040ull
 #define ADDR_GENGINE           0x1443b3068ull /* UEngine* GEngine */
 #define ADDR_TMAXFPS_VALUE     0x1443b3578ull /* float* to t.MaxFPS game-thread value */
+#define ADDR_WORLD_TICK        0x141f02230ull
+#define ADDR_BATTLE_COUNTER    0x14470d0c4ull
+#define ADDR_BATTLE_COUNTER_INC 0x1402dc34cull
+#define ADDR_FRAME_LOOP        0x140396450ull
+#define ADDR_GAME_TICK         0x141e38f70ull
+#define ADDR_FRAME_SYNC        0x1421876d0ull
+#define ADDR_FENCE_WAIT        0x1415efec0ull
 
 static int bytes_match(const void *p, const char *hex) {
   const uint8_t *b = p;
@@ -163,6 +225,18 @@ static uint8_t *alloc_near(void *target, size_t size) {
 /* 1 = this engine frame has no battle step: gated paths return at once.
  * Read by generated machine code, so it is a plain byte. */
 static volatile uint8_t g_skip_battle = 0;
+static volatile uint64_t g_clock_advances[2];
+
+/* These measurements run on the engine thread. Read the battle counter at
+ * frame boundaries instead of adding another detour to the simulation core. */
+static struct {
+  double last_frame, window_start;
+  DWORD engine_thread;
+  uint32_t last_battle;
+  uint64_t last_clock[2], engine_frames, battle_completed, counter_resets;
+  uint64_t clock[2];
+  sc6_duration world, engine_time;
+} measurements;
 
 static double qpc_seconds(void) {
   static LARGE_INTEGER freq;
@@ -189,16 +263,33 @@ static uint8_t *make_gate_stub(uint8_t *mem, int returns_float, void ***tramp_sl
   return p;
 }
 
-/* Clock-increment cave, reached by `call`: push rax; mov rax,&g_skip_battle;
- * cmp byte [rax],0; pop rax; jne done; inc dword [rbx+0x3A4]; done: ret. */
-static uint8_t *make_clock_cave(uint8_t *mem) {
+/* The clock cave runs in place of the original INC. Restore incoming flags
+ * before INC, because INC preserves the carry flag. Restore them on skips too. */
+static uint8_t *make_clock_cave(uint8_t *mem, unsigned clock_index) {
   uint8_t *p = mem;
+  *p++ = 0x9C; /* pushfq */
   *p++ = 0x50;
   *p++ = 0x48; *p++ = 0xB8; *(uint64_t *)p = (uint64_t)(uintptr_t)&g_skip_battle; p += 8;
   *p++ = 0x80; *p++ = 0x38; *p++ = 0x00;
   *p++ = 0x58;
-  *p++ = 0x75; *p++ = 0x06;
+  *p++ = 0x75;
+  uint8_t *skip_offset = p++;
+  *p++ = 0x9D; /* popfq: restore the original carry flag before INC */
   *p++ = 0xFF; *p++ = 0x83; *p++ = 0xA4; *p++ = 0x03; *p++ = 0x00; *p++ = 0x00;
+  if (cfg_measure) {
+    /* Count only an executed INC. Preserve its flags and all registers.
+     * lock inc keeps counts valid if a second thread reaches a clock site. */
+    *p++ = 0x9C; /* pushfq */
+    *p++ = 0x50; /* push rax */
+    *p++ = 0x48; *p++ = 0xB8;
+    *(uint64_t *)p = (uint64_t)(uintptr_t)&g_clock_advances[clock_index]; p += 8;
+    *p++ = 0xF0; *p++ = 0x48; *p++ = 0xFF; *p++ = 0x00; /* lock inc qword [rax] */
+    *p++ = 0x58; /* pop rax */
+    *p++ = 0x9D; /* popfq */
+  }
+  *p++ = 0xC3;
+  *skip_offset = (uint8_t)(p - skip_offset - 1);
+  *p++ = 0x9D; /* skipped INC: restore the original flags */
   *p++ = 0xC3;
   return p;
 }
@@ -210,7 +301,8 @@ static int install_gates(void) {
     return 0;
   }
   uint8_t *p = mem;
-  for (size_t i = 0; i < sizeof(kGates) / sizeof(kGates[0]); i++) {
+  size_t gate_count = cfg_gate ? sizeof(kGates) / sizeof(kGates[0]) : 0;
+  for (size_t i = 0; i < gate_count; i++) {
     void *target = ADDR(kGates[i].addr);
     if (!bytes_match(target, kGates[i].prologue_hex)) {
       log_msg("gates: prologue mismatch at %s; not hooking anything", kGates[i].name);
@@ -223,7 +315,7 @@ static int install_gates(void) {
       return 0;
     }
   }
-  for (size_t i = 0; i < sizeof(kGates) / sizeof(kGates[0]); i++) {
+  for (size_t i = 0; i < gate_count; i++) {
     void **tramp_slot;
     uint8_t *stub = p;
     p = make_gate_stub(p, kGates[i].returns_float, &tramp_slot);
@@ -238,7 +330,7 @@ static int install_gates(void) {
   }
   for (size_t i = 0; i < sizeof(kClockIncs) / sizeof(kClockIncs[0]); i++) {
     uint8_t *cave = p;
-    p = make_clock_cave(p);
+    p = make_clock_cave(p, (unsigned)i);
     uint8_t *site = ADDR(kClockIncs[i]);
     int64_t rel = (int64_t)(cave - (site + 5));
     if (rel != (int32_t)rel) {
@@ -261,8 +353,210 @@ static int install_gates(void) {
 
 typedef float (*get_max_tick_rate_fn)(void *self, float delta, BOOL allow_smoothing);
 typedef void (*update_time_fn)(void *self);
+/* The target prologue consumes RCX (world), EDX (tick type), and XMM2 (delta).
+ * This is UWorld::Tick(ELevelTick, float) in the checked UE4 executable. */
+typedef void (*world_tick_fn)(void *world, int tick_type, float delta);
 static get_max_tick_rate_fn orig_get_max_tick_rate;
 static update_time_fn orig_update_time;
+static world_tick_fn orig_world_tick;
+
+typedef void (*frame_loop_fn)(void *loop);
+typedef void (*game_tick_fn)(void *engine, float delta, uint8_t idle);
+typedef void (*sync_fn)(void *self, uint8_t option);
+static frame_loop_fn orig_frame_loop;
+static game_tick_fn orig_game_tick;
+static sync_fn orig_frame_sync, orig_fence_wait;
+static struct {
+  DWORD thread;
+  unsigned frame_depth, game_depth, sync_depth, fence_depth;
+  double window_start;
+  uint64_t sync_in_game;
+  sc6_duration loop, game, world, sync, fence;
+} frame_timers;
+
+static double unix_seconds(void) {
+  FILETIME stamp;
+  ULARGE_INTEGER ticks;
+  GetSystemTimeAsFileTime(&stamp);
+  ticks.LowPart = stamp.dwLowDateTime;
+  ticks.HighPart = stamp.dwHighDateTime;
+  return (double)(ticks.QuadPart - 116444736000000000ull) / 10000000.0;
+}
+
+static int inside_measured_frame(void) {
+  return cfg_frame_timers && frame_timers.frame_depth &&
+         GetCurrentThreadId() == frame_timers.thread;
+}
+
+static void hook_game_tick(void *engine, float delta, uint8_t idle) {
+  if (!inside_measured_frame()) {
+    orig_game_tick(engine, delta, idle);
+    return;
+  }
+  unsigned depth = frame_timers.game_depth++;
+  double start = depth ? 0.0 : qpc_seconds();
+  orig_game_tick(engine, delta, idle);
+  frame_timers.game_depth--;
+  if (!depth)
+    sc6_duration_add(&frame_timers.game, (qpc_seconds() - start) * 1000.0);
+}
+
+static void hook_frame_sync(void *self, uint8_t allow_lag) {
+  if (!inside_measured_frame()) {
+    orig_frame_sync(self, allow_lag);
+    return;
+  }
+  unsigned depth = frame_timers.sync_depth++;
+  double start = depth ? 0.0 : qpc_seconds();
+  if (!depth && frame_timers.game_depth)
+    frame_timers.sync_in_game++;
+  orig_frame_sync(self, allow_lag);
+  frame_timers.sync_depth--;
+  if (!depth)
+    sc6_duration_add(&frame_timers.sync, (qpc_seconds() - start) * 1000.0);
+}
+
+static void hook_fence_wait(void *self, uint8_t process_tasks) {
+  if (!inside_measured_frame()) {
+    orig_fence_wait(self, process_tasks);
+    return;
+  }
+  unsigned depth = frame_timers.fence_depth++;
+  double start = depth ? 0.0 : qpc_seconds();
+  orig_fence_wait(self, process_tasks);
+  frame_timers.fence_depth--;
+  if (!depth)
+    sc6_duration_add(&frame_timers.fence, (qpc_seconds() - start) * 1000.0);
+}
+
+static void hook_frame_loop(void *loop) {
+  DWORD thread = GetCurrentThreadId();
+  if (!cfg_frame_timers || (frame_timers.thread && frame_timers.thread != thread) || frame_timers.frame_depth) {
+    orig_frame_loop(loop);
+    return;
+  }
+  frame_timers.thread = thread;
+  double start = qpc_seconds();
+  if (!frame_timers.window_start)
+    frame_timers.window_start = start;
+  frame_timers.frame_depth++;
+  orig_frame_loop(loop);
+  frame_timers.frame_depth--;
+  double end = qpc_seconds();
+  sc6_duration_add(&frame_timers.loop, (end - start) * 1000.0);
+  double elapsed = end - frame_timers.window_start;
+  if (elapsed < 1.0)
+    return;
+  log_msg("frame_detail_v=1 unix_s=%.6f elapsed_s=%.6f frames=%llu "
+          "loop_total_ms=%.6f loop_max_ms=%.6f "
+          "game_calls=%llu game_total_ms=%.6f game_max_ms=%.6f "
+          "world_calls=%llu world_total_ms=%.6f world_max_ms=%.6f "
+          "sync_calls=%llu sync_total_ms=%.6f sync_max_ms=%.6f "
+          "fence_calls=%llu fence_total_ms=%.6f fence_max_ms=%.6f sync_in_game=%llu",
+          unix_seconds(), elapsed, (unsigned long long)frame_timers.loop.count,
+          frame_timers.loop.total_ms, frame_timers.loop.max_ms,
+          (unsigned long long)frame_timers.game.count, frame_timers.game.total_ms, frame_timers.game.max_ms,
+          (unsigned long long)frame_timers.world.count, frame_timers.world.total_ms, frame_timers.world.max_ms,
+          (unsigned long long)frame_timers.sync.count, frame_timers.sync.total_ms, frame_timers.sync.max_ms,
+          (unsigned long long)frame_timers.fence.count, frame_timers.fence.total_ms, frame_timers.fence.max_ms,
+          (unsigned long long)frame_timers.sync_in_game);
+  /* The following window starts at the next entry. Do not count log I/O as
+   * measured frame-loop work. The frame interval still includes that cost. */
+  frame_timers.window_start = 0.0;
+  frame_timers.loop = frame_timers.game = frame_timers.world = (sc6_duration){0};
+  frame_timers.sync = frame_timers.fence = (sc6_duration){0};
+  frame_timers.sync_in_game = 0;
+}
+
+static int install_frame_timers(void) {
+  struct {
+    const char *name;
+    uint64_t addr;
+    const char *bytes;
+    void *hook;
+    void **original;
+  } sites[] = {
+    {"frame loop", ADDR_FRAME_LOOP, "488bc448895810488970185557415441", hook_frame_loop, (void **)&orig_frame_loop},
+    {"game engine tick", ADDR_GAME_TICK, "488bc444884018488948085553565741", hook_game_tick, (void **)&orig_game_tick},
+    {"frame-end sync", ADDR_FRAME_SYNC, "48895c24084889742410574883ec2048", hook_frame_sync, (void **)&orig_frame_sync},
+    {"render fence wait", ADDR_FENCE_WAIT, "48895c2408574883ec20803d6f19d602", hook_fence_wait, (void **)&orig_fence_wait},
+  };
+  unsigned count = sizeof(sites) / sizeof(sites[0]);
+  for (unsigned i = 0; i < count; i++) {
+    if (!bytes_match(ADDR(sites[i].addr), sites[i].bytes)) {
+      log_msg("frame timers: bytes differ at %s; no detail hooks installed", sites[i].name);
+      return 0;
+    }
+  }
+  for (unsigned i = 0; i < count; i++) {
+    MH_STATUS status = MH_CreateHook(ADDR(sites[i].addr), sites[i].hook, sites[i].original);
+    if (status != MH_OK) {
+      log_msg("frame timers: create failed at %s (%d); removing detail hooks", sites[i].name, status);
+      while (i)
+        MH_RemoveHook(ADDR(sites[--i].addr));
+      return 0;
+    }
+  }
+  log_msg("frame timers: four detail hooks created; durations include nested work and waits");
+  return 1;
+}
+
+static void hook_world_tick(void *world, int tick_type, float delta) {
+  if (!cfg_measure || GetCurrentThreadId() != measurements.engine_thread) {
+    orig_world_tick(world, tick_type, delta);
+    return;
+  }
+  double start = qpc_seconds();
+  orig_world_tick(world, tick_type, delta);
+  double elapsed_ms = (qpc_seconds() - start) * 1000.0;
+  sc6_duration_add(&measurements.world, elapsed_ms);
+  if (inside_measured_frame())
+    sc6_duration_add(&frame_timers.world, elapsed_ms);
+}
+
+static void measure_frame(double now, double timing_start) {
+  uint32_t battle = *(volatile uint32_t *)ADDR(ADDR_BATTLE_COUNTER);
+  if (measurements.last_frame == 0.0) {
+    measurements.engine_thread = GetCurrentThreadId();
+    measurements.last_frame = measurements.window_start = now;
+    measurements.last_battle = battle;
+    for (unsigned i = 0; i < 2; i++)
+      measurements.last_clock[i] = g_clock_advances[i];
+    log_msg("measurement: engine_thread=%lu battle_counter=0x%llx; "
+            "durations include waits; only world ticks on this thread are timed",
+            (unsigned long)measurements.engine_thread, (unsigned long long)ADDR_BATTLE_COUNTER);
+    return;
+  }
+  measurements.engine_frames++;
+  sc6_duration_add(&measurements.engine_time, (now - timing_start) * 1000.0);
+  measurements.battle_completed += sc6_counter_delta(measurements.last_battle, battle,
+                                                     &measurements.counter_resets);
+  measurements.last_battle = battle;
+  measurements.last_frame = now;
+  for (unsigned i = 0; i < 2; i++) {
+    uint64_t current = g_clock_advances[i];
+    measurements.clock[i] += current - measurements.last_clock[i];
+    measurements.last_clock[i] = current;
+  }
+  double elapsed = now - measurements.window_start;
+  if (elapsed < 1.0)
+    return;
+  log_msg("metrics_v=1 unix_s=%.6f elapsed_s=%.6f engine_frames=%llu "
+          "battle_completed=%llu battle_counter=%u counter_resets=%llu clock_r1=%llu clock_r2=%llu "
+          "world_calls=%llu world_total_ms=%.6f world_max_ms=%.6f "
+          "engine_time_total_ms=%.6f engine_time_max_ms=%.6f",
+          unix_seconds(), elapsed, (unsigned long long)measurements.engine_frames,
+          (unsigned long long)measurements.battle_completed, battle,
+          (unsigned long long)measurements.counter_resets,
+          (unsigned long long)measurements.clock[0], (unsigned long long)measurements.clock[1],
+          (unsigned long long)measurements.world.count, measurements.world.total_ms, measurements.world.max_ms,
+          measurements.engine_time.total_ms, measurements.engine_time.max_ms);
+  measurements.window_start = now;
+  measurements.engine_frames = measurements.battle_completed = measurements.counter_resets = 0;
+  measurements.clock[0] = measurements.clock[1] = 0;
+  measurements.world = (sc6_duration){0};
+  measurements.engine_time = (sc6_duration){0};
+}
 
 static void log_engine_settings(void *engine) {
   uint8_t *e = engine;
@@ -287,12 +581,15 @@ static float hook_get_max_tick_rate(void *self, float delta, BOOL allow_smoothin
 }
 
 static void hook_update_time(void *self) {
+  double timing_start = cfg_measure ? qpc_seconds() : 0.0;
   orig_update_time(self);
 
   static double last, acc, window_start;
   static unsigned frames, steps;
   const double step = 1.0 / 60.0;
   double now = qpc_seconds();
+  if (cfg_measure)
+    measure_frame(now, timing_start);
   if (last == 0.0) {
     last = now;
     window_start = now;
@@ -314,10 +611,796 @@ static void hook_update_time(void *self) {
   }
   frames++;
   if (now - window_start >= 1.0) {
-    log_msg("frames=%u steps=%u (%.1f s)", frames, cfg_gate ? steps : frames, now - window_start);
+    log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, cfg_gate ? steps : frames, now - window_start);
     frames = steps = 0;
     window_start = now;
   }
+}
+
+/* ---------- shader capture ----------------------------------------------- */
+
+/* With SC6VRR_SHADER_DIR=<Windows path>, every ID3D11Device::Create*Shader call
+ * is recorded for notes/native-metal.md step 1. Each unique bytecode blob is
+ * written once to <dir>\dxbc\<sha256>.dxbc, and every call adds one line to
+ * <dir>\index-<time>-<pid>.tsv. Each unique input layout (the description of
+ * the vertex buffer contents that a vertex shader reads) goes to
+ * <dir>\layouts\<sha256>.txt, and each unique blend state to
+ * <dir>\blend\<sha256>.txt. Each new combination of the state that a Metal
+ * render pipeline depends on (shaders, input layout, vertex strides, topology,
+ * target formats, blend state) adds one line to <dir>\bindings-<time>-<pid>.tsv.
+ * The output is game material: keep it private.
+ *
+ * The device and its immediate context are hooked through their vtables, so the
+ * hooks go in after the game creates its first device. d3d11.dll is a static
+ * import of the exe, so its creation exports can be hooked from DllMain. */
+
+/* Vtable slot numbers come from the C interface in d3d11.h, so they cannot
+ * drift from the declaration order. */
+#define DEVICE_SLOT(m) ((int)(offsetof(ID3D11DeviceVtbl, m) / sizeof(void *)))
+#define CONTEXT_SLOT(m) ((int)(offsetof(ID3D11DeviceContextVtbl, m) / sizeof(void *)))
+
+enum { STAGE_VS, STAGE_GS, STAGE_GS_SO, STAGE_PS, STAGE_HS, STAGE_DS, STAGE_CS, STAGE_COUNT };
+static const char *const kStageNames[STAGE_COUNT] = {"vs", "gs", "gs_so", "ps", "hs", "ds", "cs"};
+/* The documented ID3D11Device order; a mismatch here means a different header. */
+_Static_assert(DEVICE_SLOT(CreateInputLayout) == 11 && DEVICE_SLOT(CreateVertexShader) == 12 &&
+                   DEVICE_SLOT(CreateComputeShader) == 18 && DEVICE_SLOT(GetImmediateContext) == 40,
+               "unexpected ID3D11Device vtable layout");
+_Static_assert(CONTEXT_SLOT(PSSetShader) == 9 && CONTEXT_SLOT(VSSetShader) == 11 && CONTEXT_SLOT(DrawIndexed) == 12 &&
+                   CONTEXT_SLOT(Draw) == 13 && CONTEXT_SLOT(IASetInputLayout) == 17 &&
+                   CONTEXT_SLOT(DrawInstancedIndirect) == 40,
+               "unexpected ID3D11DeviceContext vtable layout");
+static const int kStageSlots[STAGE_COUNT] = {
+    DEVICE_SLOT(CreateVertexShader), DEVICE_SLOT(CreateGeometryShader),
+    DEVICE_SLOT(CreateGeometryShaderWithStreamOutput), DEVICE_SLOT(CreatePixelShader),
+    DEVICE_SLOT(CreateHullShader), DEVICE_SLOT(CreateDomainShader), DEVICE_SLOT(CreateComputeShader)};
+
+/* DXBC is the Direct3D 10/11 shader container: "DXBC", a 16-byte checksum,
+ * version 1, total size, chunk count, then chunk offsets. The first token of
+ * the SHEX (shader model 5) or SHDR (shader model 4) chunk holds the program
+ * type in its high 16 bits and the model in its low byte. */
+typedef struct {
+  int valid;
+  unsigned program_type, major, minor;
+} dxbc_info;
+
+static dxbc_info parse_dxbc(const uint8_t *p, size_t n) {
+  dxbc_info info = {0};
+  uint32_t total, count;
+  if (n < 32 || memcmp(p, "DXBC", 4))
+    return info;
+  memcpy(&total, p + 24, 4);
+  memcpy(&count, p + 28, 4);
+  if (total < 32 || total > n || count > (total - 32) / 4)
+    return info;
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t off, size, token;
+    memcpy(&off, p + 32 + 4 * i, 4);
+    if (off < 32 || off > total - 12)
+      continue;
+    memcpy(&size, p + off + 4, 4);
+    if ((memcmp(p + off, "SHEX", 4) && memcmp(p + off, "SHDR", 4)) || size < 4 || size > total - off - 8)
+      continue;
+    memcpy(&token, p + off + 8, 4);
+    info.valid = 1;
+    info.program_type = token >> 16;
+    info.major = (token >> 4) & 0xF;
+    info.minor = token & 0xF;
+    return info;
+  }
+  return info;
+}
+
+/* Writes "vs_5_0" style names; program types 0-5 are ps, vs, gs, hs, ds, cs. */
+static void dxbc_model_name(dxbc_info info, char out[16]) {
+  static const char *const kTypes[] = {"ps", "vs", "gs", "hs", "ds", "cs"};
+  if (info.valid && info.program_type < 6)
+    snprintf(out, 16, "%s_%u_%u", kTypes[info.program_type], info.major, info.minor);
+  else
+    snprintf(out, 16, "unknown");
+}
+
+static int sha256_raw(const void *data, size_t n, uint8_t digest[32]) {
+  BCRYPT_ALG_HANDLE alg = NULL;
+  BCRYPT_HASH_HANDLE hash = NULL;
+  int ok = n <= 0xFFFFFFFFu && BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0 &&
+           BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) == 0 &&
+           BCryptHashData(hash, (PUCHAR)data, (ULONG)n, 0) == 0 &&
+           BCryptFinishHash(hash, digest, 32, 0) == 0;
+  if (hash) BCryptDestroyHash(hash);
+  if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+  return ok;
+}
+
+static void digest_hex(const uint8_t digest[32], char hex[65]) {
+  for (int i = 0; i < 32; i++)
+    sprintf(hex + 2 * i, "%02x", digest[i]);
+}
+
+static int sha256_hex(const void *data, size_t n, char hex[65]) {
+  uint8_t digest[32];
+  if (!sha256_raw(data, n, digest))
+    return 0;
+  digest_hex(digest, hex);
+  return 1;
+}
+
+/* Content identities. Each unique SHA-256 (of a shader's bytecode or of a
+ * state description) gets a small number, its ID. The object table maps each
+ * object pointer that the game binds to the ID of what created it. The game
+ * recreates equal objects at new addresses, so recorded pipelines are keyed by
+ * IDs, not by addresses: equal content is one pipeline, however often it is
+ * recreated. The device can reuse a freed address only for a new object, and
+ * that object's creation overwrites the entry. object_lock guards both tables;
+ * draw-time lookups take it shared. */
+#define OBJECT_SLOTS (1 << 18)
+#define ID_LIMIT (1 << 16)
+#define ID_NONE 0u
+#define ID_UNKNOWN 0xFFFFFFFFu
+static struct {
+  void *object;
+  uint32_t id, extra;
+} object_ids[OBJECT_SLOTS];
+static uint8_t id_digests[ID_LIMIT][32];
+static uint32_t id_slots[ID_LIMIT * 2];
+static uint32_t id_count;
+static size_t object_count;
+static int object_table_full_logged, id_table_full_logged;
+static SRWLOCK object_lock = SRWLOCK_INIT;
+
+static size_t pointer_slot(const void *p, size_t slots) {
+  return (size_t)((((uint64_t)(uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull) >> 32) & (slots - 1);
+}
+
+/* Caller holds object_lock exclusively. The table stays at most half full. */
+static uint32_t intern_digest(const uint8_t digest[32]) {
+  uint64_t h;
+  memcpy(&h, digest, sizeof(h));
+  for (size_t i = h & (ID_LIMIT * 2 - 1);; i = (i + 1) & (ID_LIMIT * 2 - 1)) {
+    uint32_t id = id_slots[i];
+    if (!id) {
+      if (id_count >= ID_LIMIT - 1) {
+        if (!id_table_full_logged++)
+          log_msg("shaders: ID table full; later objects show 'unknown'");
+        return ID_UNKNOWN;
+      }
+      id = ++id_count;
+      memcpy(id_digests[id], digest, 32);
+      id_slots[i] = id;
+      return id;
+    }
+    if (!memcmp(id_digests[id], digest, 32))
+      return id;
+  }
+}
+
+/* `extra` is kept with the pointer; for input layouts it is the mask of
+ * vertex buffer slots that the layout reads. */
+static void object_id_set(void *object, const uint8_t digest[32], uint32_t extra) {
+  AcquireSRWLockExclusive(&object_lock);
+  uint32_t id = intern_digest(digest);
+  for (size_t i = pointer_slot(object, OBJECT_SLOTS);; i = (i + 1) & (OBJECT_SLOTS - 1)) {
+    if (object_ids[i].object == object) {
+      object_ids[i].id = id;
+      object_ids[i].extra = extra;
+      break;
+    }
+    if (!object_ids[i].object) {
+      /* Keep a quarter free so that probes stay short and always end. */
+      if (object_count >= OBJECT_SLOTS / 4 * 3) {
+        if (!object_table_full_logged++)
+          log_msg("shaders: object table full; later bindings show 'unknown'");
+        break;
+      }
+      object_ids[i].object = object;
+      object_ids[i].id = id;
+      object_ids[i].extra = extra;
+      object_count++;
+      break;
+    }
+  }
+  ReleaseSRWLockExclusive(&object_lock);
+}
+
+/* Returns ID_NONE for NULL and ID_UNKNOWN for an object created before the hooks. */
+static uint32_t object_lookup(void *object, uint32_t *extra) {
+  uint32_t id = object ? ID_UNKNOWN : ID_NONE;
+  if (extra)
+    *extra = 0;
+  if (!object)
+    return id;
+  AcquireSRWLockShared(&object_lock);
+  for (size_t i = pointer_slot(object, OBJECT_SLOTS); object_ids[i].object; i = (i + 1) & (OBJECT_SLOTS - 1))
+    if (object_ids[i].object == object) {
+      id = object_ids[i].id;
+      if (extra)
+        *extra = object_ids[i].extra;
+      break;
+    }
+  ReleaseSRWLockShared(&object_lock);
+  return id;
+}
+
+static void id_hex(uint32_t id, char hex[65]) {
+  if (id == ID_NONE) {
+    strcpy(hex, "none");
+  } else if (id == ID_UNKNOWN) {
+    strcpy(hex, "unknown");
+  } else {
+    AcquireSRWLockShared(&object_lock);
+    digest_hex(id_digests[id], hex);
+    ReleaseSRWLockShared(&object_lock);
+  }
+}
+
+static char shader_dir[MAX_PATH];
+static FILE *shader_index, *binding_file;
+static CRITICAL_SECTION shader_lock, binding_lock;
+static volatile LONG shader_hooks_installed;
+static uint64_t shader_calls, shader_unique;
+
+static int shader_capture_open(const char *dir) {
+  char path[MAX_PATH + 64];
+  SYSTEMTIME t;
+  if (strlen(dir) >= sizeof(shader_dir) - 80)
+    return 0;
+  strcpy(shader_dir, dir);
+  CreateDirectoryA(shader_dir, NULL);
+  snprintf(path, sizeof(path), "%s\\dxbc", shader_dir);
+  CreateDirectoryA(path, NULL);
+  snprintf(path, sizeof(path), "%s\\layouts", shader_dir);
+  CreateDirectoryA(path, NULL);
+  snprintf(path, sizeof(path), "%s\\blend", shader_dir);
+  CreateDirectoryA(path, NULL);
+  GetLocalTime(&t);
+  snprintf(path, sizeof(path), "%s\\bindings-%04d%02d%02d-%02d%02d%02d-%lu.tsv", shader_dir, t.wYear,
+           t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
+  binding_file = fopen(path, "w");
+  snprintf(path, sizeof(path), "%s\\index-%04d%02d%02d-%02d%02d%02d-%lu.tsv", shader_dir, t.wYear, t.wMonth,
+           t.wDay, t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
+  shader_index = fopen(path, "w");
+  if (!shader_index || !binding_file)
+    return 0;
+  InitializeCriticalSection(&shader_lock);
+  InitializeCriticalSection(&binding_lock);
+  fprintf(shader_index, "seconds\tthread\tstage\tmodel\tbytes\tsha256\thresult\tnew\n");
+  fflush(shader_index);
+  fprintf(binding_file, "seconds\tthread\ttopology\tinput_layout\tvs\tgs\tps\tblend\trt_formats\tdsv_format"
+                        "\tmultisample\tstrides\n");
+  fflush(binding_file);
+  log_msg("shaders: recording to %s", path);
+  return 1;
+}
+
+/* Records one Create*Shader call. Runs after the real call so that the result
+ * code is known; the bytecode stays valid because the caller still owns it. */
+static void capture_shader(int stage, const void *code, SIZE_T length, HRESULT hr, void *object) {
+  char hex[65] = "none", model[16] = "none", path[MAX_PATH + 96], tmp[MAX_PATH + 100];
+  uint8_t digest[32];
+  int is_new = 0, hashed = 0;
+  if (code && length) {
+    hashed = sha256_raw(code, length, digest);
+    if (hashed)
+      digest_hex(digest, hex);
+    else
+      strcpy(hex, "hash-failed");
+    dxbc_model_name(parse_dxbc(code, length), model);
+  }
+  EnterCriticalSection(&shader_lock);
+  shader_calls++;
+  if (hashed && object)
+    object_id_set(object, digest, 0);
+  if (code && length && hex[0] != 'h') {
+    snprintf(path, sizeof(path), "%s\\dxbc\\%s.dxbc", shader_dir, hex);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+      /* Write to a temporary name first, so an interrupted write never looks
+       * like a complete shader on the next run. */
+      snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+      FILE *f = fopen(tmp, "wb");
+      size_t written = f ? fwrite(code, 1, length, f) : 0;
+      if (f && fclose(f) == 0 && written == length && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        is_new = 1;
+        shader_unique++;
+      } else {
+        DeleteFileA(tmp);
+        log_msg("shaders: could not write %s", path);
+      }
+    }
+  }
+  fprintf(shader_index, "%.6f\t%lu\t%s\t%s\t%llu\t%s\t0x%08lx\t%d\n", qpc_seconds(), GetCurrentThreadId(),
+          kStageNames[stage], model, (unsigned long long)length, hex, (unsigned long)hr, is_new);
+  fflush(shader_index);
+  if (shader_calls == 1 || shader_calls % 1000 == 0)
+    log_msg("shaders: %llu calls, %llu new files this run", (unsigned long long)shader_calls,
+            (unsigned long long)shader_unique);
+  LeaveCriticalSection(&shader_lock);
+}
+
+typedef HRESULT(WINAPI *create_shader_fn)(void *self, const void *code, SIZE_T length, void *linkage, void **out);
+typedef HRESULT(WINAPI *create_gs_so_fn)(void *self, const void *code, SIZE_T length, const void *entries,
+                                         UINT entry_count, const UINT *strides, UINT stride_count,
+                                         UINT rasterized_stream, void *linkage, void **out);
+static create_shader_fn orig_create_shader[STAGE_COUNT];
+static create_gs_so_fn orig_create_gs_so;
+
+#define SHADER_HOOK(stage)                                                                              \
+  static HRESULT WINAPI hook_create_##stage(void *self, const void *code, SIZE_T length, void *linkage, \
+                                            void **out) {                                               \
+    HRESULT hr = orig_create_shader[STAGE_##stage](self, code, length, linkage, out);                   \
+    capture_shader(STAGE_##stage, code, length, hr, SUCCEEDED(hr) && out ? *out : NULL);                \
+    return hr;                                                                                          \
+  }
+SHADER_HOOK(VS)
+SHADER_HOOK(GS)
+SHADER_HOOK(PS)
+SHADER_HOOK(HS)
+SHADER_HOOK(DS)
+SHADER_HOOK(CS)
+
+static HRESULT WINAPI hook_create_GS_SO(void *self, const void *code, SIZE_T length, const void *entries,
+                                        UINT entry_count, const UINT *strides, UINT stride_count,
+                                        UINT rasterized_stream, void *linkage, void **out) {
+  HRESULT hr = orig_create_gs_so(self, code, length, entries, entry_count, strides, stride_count,
+                                 rasterized_stream, linkage, out);
+  capture_shader(STAGE_GS_SO, code, length, hr, SUCCEEDED(hr) && out ? *out : NULL);
+  return hr;
+}
+
+/* Writes one described state object (an input layout or a blend state) once to
+ * <dir>\<folder>\<sha256>.txt and adds an index line. Its identity is the
+ * SHA-256 of its text form, so the same description created twice gets the
+ * same file. Enum values stay numeric (DXGI_FORMAT, D3D11_BLEND, and so on).
+ * `extra` is kept with the object pointer; for layouts it is the mask of
+ * vertex buffer slots that the layout reads. */
+static void capture_described_object(const char *folder, const char *stage, const char *header,
+                                     const char *text, size_t used, void *object, uint32_t extra) {
+  char hex[65], path[MAX_PATH + 96], tmp[MAX_PATH + 100];
+  uint8_t digest[32];
+  int is_new = 0;
+  if (!sha256_raw(text, used, digest))
+    return;
+  digest_hex(digest, hex);
+  EnterCriticalSection(&shader_lock);
+  object_id_set(object, digest, extra);
+  snprintf(path, sizeof(path), "%s\\%s\\%s.txt", shader_dir, folder, hex);
+  if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (f) {
+      fprintf(f, "%s%s", header, text);
+      if (fclose(f) == 0 && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        is_new = 1;
+      else
+        DeleteFileA(tmp);
+    }
+  }
+  fprintf(shader_index, "%.6f\t%lu\t%s\t%s\t%llu\t%s\t0x00000000\t%d\n", qpc_seconds(), GetCurrentThreadId(), stage,
+          folder, (unsigned long long)used, hex, is_new);
+  fflush(shader_index);
+  LeaveCriticalSection(&shader_lock);
+}
+
+static void capture_input_layout(const D3D11_INPUT_ELEMENT_DESC *elements, UINT count, const void *code,
+                                 SIZE_T length, void *layout) {
+  char text[D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT * 160] = "", header[160], vs_hex[65] = "none";
+  size_t used = 0;
+  uint32_t slots = 0;
+  for (UINT i = 0; elements && i < count && i < D3D11_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT; i++) {
+    const D3D11_INPUT_ELEMENT_DESC *e = &elements[i];
+    int n = snprintf(text + used, sizeof(text) - used, "%.64s\t%u\t%u\t%u\t%u\t%u\t%u\n",
+                     e->SemanticName ? e->SemanticName : "", e->SemanticIndex, (unsigned)e->Format,
+                     e->InputSlot, e->AlignedByteOffset, (unsigned)e->InputSlotClass, e->InstanceDataStepRate);
+    if (n < 0 || (size_t)n >= sizeof(text) - used)
+      break;
+    used += n;
+    if (e->InputSlot < 32)
+      slots |= 1u << e->InputSlot;
+  }
+  if (code && length)
+    sha256_hex(code, length, vs_hex);
+  snprintf(header, sizeof(header),
+           "# vertex shader signature: %s\nsemantic\tindex\tformat\tslot\toffset\tclass\tstep_rate\n", vs_hex);
+  capture_described_object("layouts", "il", header, text, used, layout, slots);
+}
+
+static void capture_blend_state(const D3D11_BLEND_DESC *desc, void *state) {
+  char text[1024];
+  size_t used = 0;
+  if (!desc)
+    return;
+  used += snprintf(text, sizeof(text), "alpha_to_coverage\t%d\nindependent_blend\t%d\n",
+                   (int)desc->AlphaToCoverageEnable, (int)desc->IndependentBlendEnable);
+  for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+    const D3D11_RENDER_TARGET_BLEND_DESC *r = &desc->RenderTarget[i];
+    used += snprintf(text + used, sizeof(text) - used, "rt%d\t%d\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n", i,
+                     (int)r->BlendEnable, (unsigned)r->SrcBlend, (unsigned)r->DestBlend, (unsigned)r->BlendOp,
+                     (unsigned)r->SrcBlendAlpha, (unsigned)r->DestBlendAlpha, (unsigned)r->BlendOpAlpha,
+                     (unsigned)r->RenderTargetWriteMask);
+  }
+  capture_described_object("blend", "bs", "# rtN: enable src dst op src_alpha dst_alpha op_alpha write_mask\n",
+                           text, used, state, 0);
+}
+
+typedef HRESULT(WINAPI *create_input_layout_fn)(void *self, const D3D11_INPUT_ELEMENT_DESC *elements, UINT count,
+                                                const void *code, SIZE_T length, void **out);
+typedef HRESULT(WINAPI *create_blend_state_fn)(void *self, const D3D11_BLEND_DESC *desc, void **out);
+static create_input_layout_fn orig_create_input_layout;
+static create_blend_state_fn orig_create_blend_state;
+
+static HRESULT WINAPI hook_create_input_layout(void *self, const D3D11_INPUT_ELEMENT_DESC *elements, UINT count,
+                                               const void *code, SIZE_T length, void **out) {
+  HRESULT hr = orig_create_input_layout(self, elements, count, code, length, out);
+  if (SUCCEEDED(hr) && out && *out)
+    capture_input_layout(elements, count, code, length, *out);
+  return hr;
+}
+
+static HRESULT WINAPI hook_create_blend_state(void *self, const D3D11_BLEND_DESC *desc, void **out) {
+  HRESULT hr = orig_create_blend_state(self, desc, out);
+  if (SUCCEEDED(hr) && out && *out)
+    capture_blend_state(desc, *out);
+  return hr;
+}
+
+/* Everything a Metal render pipeline depends on, for one draw: the shaders, the
+ * vertex layout and strides, the primitive class, the target formats, and the
+ * blend state. All fields are 4 bytes, so there is no padding, and memcmp and
+ * a byte hash see only real values. */
+#define STRIDE_SLOTS 16
+typedef struct {
+  uint32_t layout, vs, gs, ps, blend; /* content IDs */
+  UINT topology, rt_count, dsv_format, multisample_mask;
+  UINT rt_formats[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+  UINT strides[STRIDE_SLOTS];
+  UINT used;
+} binding_key;
+_Static_assert(sizeof(binding_key) == 4 * (5 + 4 + D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT + STRIDE_SLOTS + 1),
+               "binding_key has padding");
+
+/* The bound state of the immediate context. The Set hooks write it and the
+ * draw hooks read it. UE4 4.17 issues both from its one RHI thread, so plain
+ * stores suffice; binding_lock only protects the table of seen combinations.
+ * Strides are kept for every slot, but a draw records only the slots that its
+ * input layout reads, so stale strides in unused slots add no combinations. */
+static binding_key bound;
+static UINT bound_strides[STRIDE_SLOTS];
+static uint32_t bound_layout_slots;
+
+#define BINDING_SLOTS (1 << 16)
+static binding_key bindings_seen[BINDING_SLOTS];
+static size_t binding_count;
+static int binding_table_full_logged;
+static uint64_t draw_calls;
+
+static uint64_t fnv1a(const void *data, size_t n) {
+  const uint8_t *p = data;
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < n; i++)
+    h = (h ^ p[i]) * 0x100000001b3ull;
+  return h;
+}
+
+static void join_uints(char *out, size_t size, const UINT *values, UINT count, uint32_t mask, int with_slots) {
+  size_t used = 0;
+  out[0] = 0;
+  for (UINT i = 0; i < count && used < size; i++) {
+    if (!(mask >> i & 1))
+      continue;
+    int n = with_slots ? snprintf(out + used, size - used, "%s%u:%u", used ? "," : "", i, values[i])
+                       : snprintf(out + used, size - used, "%s%u", used ? "," : "", values[i]);
+    if (n < 0)
+      break;
+    used += n;
+  }
+  if (!used)
+    snprintf(out, size, "none");
+}
+
+/* Called on every draw. Only a combination not seen before costs more than
+ * one hash probe; its IDs are written out as hashes. */
+static void note_draw(void) {
+  binding_key key;
+  memcpy(&key, &bound, sizeof(key));
+  for (int i = 0; i < STRIDE_SLOTS; i++)
+    key.strides[i] = bound_layout_slots >> i & 1 ? bound_strides[i] : 0;
+  key.used = 0;
+  uint64_t h = fnv1a(&key, sizeof(key));
+  key.used = 1;
+  EnterCriticalSection(&binding_lock);
+  draw_calls++;
+  for (size_t i = h & (BINDING_SLOTS - 1);; i = (i + 1) & (BINDING_SLOTS - 1)) {
+    binding_key *e = &bindings_seen[i];
+    if (e->used && !memcmp(e, &key, sizeof(key)))
+      break;
+    if (!e->used) {
+      if (binding_count >= BINDING_SLOTS / 4 * 3) {
+        if (!binding_table_full_logged++)
+          log_msg("shaders: binding table full; later combinations are not recorded");
+        break;
+      }
+      memcpy(e, &key, sizeof(key));
+      binding_count++;
+      char layout[65], vs[65], gs[65], ps[65], blend[65], rts[128], strides[256];
+      id_hex(key.layout, layout);
+      id_hex(key.vs, vs);
+      id_hex(key.gs, gs);
+      id_hex(key.ps, ps);
+      id_hex(key.blend, blend);
+      join_uints(rts, sizeof(rts), key.rt_formats, key.rt_count, 0xFF, 0);
+      join_uints(strides, sizeof(strides), key.strides, STRIDE_SLOTS, bound_layout_slots, 1);
+      fprintf(binding_file, "%.6f\t%lu\t%u\t%s\t%s\t%s\t%s\t%s\t%s\t%u\t0x%x\t%s\n", qpc_seconds(),
+              GetCurrentThreadId(), key.topology, layout, vs, gs, ps, blend, rts, key.dsv_format,
+              key.multisample_mask, strides);
+      fflush(binding_file);
+      if (binding_count == 1 || binding_count % 1000 == 0)
+        log_msg("shaders: %llu draws, %llu pipeline combinations", (unsigned long long)draw_calls,
+                (unsigned long long)binding_count);
+      break;
+    }
+  }
+  LeaveCriticalSection(&binding_lock);
+}
+
+typedef void(WINAPI *set_shader_fn)(void *ctx, void *shader, void *const *instances, UINT count);
+typedef void(WINAPI *set_layout_fn)(void *ctx, void *layout);
+typedef void(WINAPI *set_topology_fn)(void *ctx, UINT topology);
+typedef void(WINAPI *set_vertex_buffers_fn)(void *ctx, UINT start, UINT count, void *const *buffers,
+                                            const UINT *strides, const UINT *offsets);
+typedef void(WINAPI *set_targets_fn)(void *ctx, UINT count, void *const *rtvs, void *dsv);
+typedef void(WINAPI *set_targets_uavs_fn)(void *ctx, UINT count, void *const *rtvs, void *dsv, UINT uav_start,
+                                          UINT uav_count, void *const *uavs, const UINT *initial_counts);
+typedef void(WINAPI *set_blend_fn)(void *ctx, void *state, const FLOAT factor[4], UINT sample_mask);
+typedef void(WINAPI *draw_fn)(void *ctx, UINT count, UINT start);
+typedef void(WINAPI *draw_indexed_fn)(void *ctx, UINT count, UINT start, INT base);
+typedef void(WINAPI *draw_indexed_instanced_fn)(void *ctx, UINT count, UINT instances, UINT start, INT base,
+                                                UINT start_instance);
+typedef void(WINAPI *draw_instanced_fn)(void *ctx, UINT count, UINT instances, UINT start, UINT start_instance);
+typedef void(WINAPI *draw_auto_fn)(void *ctx);
+typedef void(WINAPI *draw_indirect_fn)(void *ctx, void *args, UINT offset);
+typedef void(WINAPI *rtv_desc_fn)(void *view, D3D11_RENDER_TARGET_VIEW_DESC *desc);
+typedef void(WINAPI *dsv_desc_fn)(void *view, D3D11_DEPTH_STENCIL_VIEW_DESC *desc);
+
+enum {
+  CTX_VS_SET, CTX_GS_SET, CTX_PS_SET, CTX_LAYOUT, CTX_TOPOLOGY, CTX_VERTEX_BUFFERS, CTX_TARGETS,
+  CTX_TARGETS_UAVS, CTX_BLEND, CTX_DRAW, CTX_DRAW_INDEXED, CTX_DRAW_INDEXED_INSTANCED, CTX_DRAW_INSTANCED,
+  CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_COUNT
+};
+static const int kContextSlots[CTX_COUNT] = {
+    CONTEXT_SLOT(VSSetShader), CONTEXT_SLOT(GSSetShader), CONTEXT_SLOT(PSSetShader),
+    CONTEXT_SLOT(IASetInputLayout), CONTEXT_SLOT(IASetPrimitiveTopology), CONTEXT_SLOT(IASetVertexBuffers),
+    CONTEXT_SLOT(OMSetRenderTargets), CONTEXT_SLOT(OMSetRenderTargetsAndUnorderedAccessViews),
+    CONTEXT_SLOT(OMSetBlendState), CONTEXT_SLOT(Draw), CONTEXT_SLOT(DrawIndexed),
+    CONTEXT_SLOT(DrawIndexedInstanced), CONTEXT_SLOT(DrawInstanced), CONTEXT_SLOT(DrawAuto),
+    CONTEXT_SLOT(DrawIndexedInstancedIndirect), CONTEXT_SLOT(DrawInstancedIndirect)};
+static const char *const kContextNames[CTX_COUNT] = {
+    "VSSetShader", "GSSetShader", "PSSetShader", "IASetInputLayout", "IASetPrimitiveTopology",
+    "IASetVertexBuffers", "OMSetRenderTargets", "OMSetRenderTargetsAndUnorderedAccessViews", "OMSetBlendState",
+    "Draw", "DrawIndexed", "DrawIndexedInstanced", "DrawInstanced", "DrawAuto", "DrawIndexedInstancedIndirect",
+    "DrawInstancedIndirect"};
+static void *orig_context[CTX_COUNT];
+
+/* Reads the formats of the bound views. A view's format can differ from its
+ * texture's format, and the view's format is the one a pipeline must match. */
+static void note_targets(UINT count, void *const *rtvs, void *dsv) {
+  bound.rt_count = count < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT ? count : D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
+  bound.multisample_mask = 0;
+  for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+    bound.rt_formats[i] = 0;
+    if (i < bound.rt_count && rtvs && rtvs[i]) {
+      D3D11_RENDER_TARGET_VIEW_DESC desc;
+      void **vt = *(void ***)rtvs[i];
+      ((rtv_desc_fn)vt[offsetof(ID3D11RenderTargetViewVtbl, GetDesc) / sizeof(void *)])(rtvs[i], &desc);
+      bound.rt_formats[i] = desc.Format;
+      if (desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS ||
+          desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY)
+        bound.multisample_mask |= 1u << i;
+    }
+  }
+  bound.dsv_format = 0;
+  if (dsv) {
+    D3D11_DEPTH_STENCIL_VIEW_DESC desc;
+    void **vt = *(void ***)dsv;
+    ((dsv_desc_fn)vt[offsetof(ID3D11DepthStencilViewVtbl, GetDesc) / sizeof(void *)])(dsv, &desc);
+    bound.dsv_format = desc.Format;
+    if (desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMS ||
+        desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY)
+      bound.multisample_mask |= 1u << 8;
+  }
+}
+
+static void WINAPI hook_vs_set(void *ctx, void *shader, void *const *instances, UINT count) {
+  bound.vs = object_lookup(shader, NULL);
+  ((set_shader_fn)orig_context[CTX_VS_SET])(ctx, shader, instances, count);
+}
+static void WINAPI hook_gs_set(void *ctx, void *shader, void *const *instances, UINT count) {
+  bound.gs = object_lookup(shader, NULL);
+  ((set_shader_fn)orig_context[CTX_GS_SET])(ctx, shader, instances, count);
+}
+static void WINAPI hook_ps_set(void *ctx, void *shader, void *const *instances, UINT count) {
+  bound.ps = object_lookup(shader, NULL);
+  ((set_shader_fn)orig_context[CTX_PS_SET])(ctx, shader, instances, count);
+}
+static void WINAPI hook_layout_set(void *ctx, void *layout) {
+  bound.layout = object_lookup(layout, &bound_layout_slots);
+  ((set_layout_fn)orig_context[CTX_LAYOUT])(ctx, layout);
+}
+static void WINAPI hook_topology_set(void *ctx, UINT topology) {
+  bound.topology = topology;
+  ((set_topology_fn)orig_context[CTX_TOPOLOGY])(ctx, topology);
+}
+static void WINAPI hook_vertex_buffers_set(void *ctx, UINT start, UINT count, void *const *buffers,
+                                           const UINT *strides, const UINT *offsets) {
+  for (UINT i = 0; i < count && start + i < STRIDE_SLOTS; i++)
+    bound_strides[start + i] = buffers && buffers[i] && strides ? strides[i] : 0;
+  ((set_vertex_buffers_fn)orig_context[CTX_VERTEX_BUFFERS])(ctx, start, count, buffers, strides, offsets);
+}
+static void WINAPI hook_targets_set(void *ctx, UINT count, void *const *rtvs, void *dsv) {
+  note_targets(count, rtvs, dsv);
+  ((set_targets_fn)orig_context[CTX_TARGETS])(ctx, count, rtvs, dsv);
+}
+static void WINAPI hook_targets_uavs_set(void *ctx, UINT count, void *const *rtvs, void *dsv, UINT uav_start,
+                                         UINT uav_count, void *const *uavs, const UINT *initial_counts) {
+  if (count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+    note_targets(count, rtvs, dsv);
+  ((set_targets_uavs_fn)orig_context[CTX_TARGETS_UAVS])(ctx, count, rtvs, dsv, uav_start, uav_count, uavs,
+                                                        initial_counts);
+}
+static void WINAPI hook_blend_set(void *ctx, void *state, const FLOAT factor[4], UINT sample_mask) {
+  bound.blend = object_lookup(state, NULL);
+  ((set_blend_fn)orig_context[CTX_BLEND])(ctx, state, factor, sample_mask);
+}
+static void WINAPI hook_draw(void *ctx, UINT count, UINT start) {
+  note_draw();
+  ((draw_fn)orig_context[CTX_DRAW])(ctx, count, start);
+}
+static void WINAPI hook_draw_indexed(void *ctx, UINT count, UINT start, INT base) {
+  note_draw();
+  ((draw_indexed_fn)orig_context[CTX_DRAW_INDEXED])(ctx, count, start, base);
+}
+static void WINAPI hook_draw_indexed_instanced(void *ctx, UINT count, UINT instances, UINT start, INT base,
+                                               UINT start_instance) {
+  note_draw();
+  ((draw_indexed_instanced_fn)orig_context[CTX_DRAW_INDEXED_INSTANCED])(ctx, count, instances, start, base,
+                                                                        start_instance);
+}
+static void WINAPI hook_draw_instanced(void *ctx, UINT count, UINT instances, UINT start, UINT start_instance) {
+  note_draw();
+  ((draw_instanced_fn)orig_context[CTX_DRAW_INSTANCED])(ctx, count, instances, start, start_instance);
+}
+static void WINAPI hook_draw_auto(void *ctx) {
+  note_draw();
+  ((draw_auto_fn)orig_context[CTX_DRAW_AUTO])(ctx);
+}
+static void WINAPI hook_draw_indexed_indirect(void *ctx, void *args, UINT offset) {
+  note_draw();
+  ((draw_indirect_fn)orig_context[CTX_DRAW_INDEXED_INDIRECT])(ctx, args, offset);
+}
+static void WINAPI hook_draw_instanced_indirect(void *ctx, void *args, UINT offset) {
+  note_draw();
+  ((draw_indirect_fn)orig_context[CTX_DRAW_INSTANCED_INDIRECT])(ctx, args, offset);
+}
+
+/* Replaces vtable pointers instead of patching the methods' code. Under
+ * CrossOver Preview with FEX, d3d11.dll is ARM64EC: its methods are native
+ * ARM64 code, so an x64 jump written over them is an illegal instruction
+ * (crash 0xC000001D at the hooked CreatePixelShader, 2026-10-16). The game's
+ * x64 code reads the pointer from the vtable, so swapping the pointer works
+ * for x64 and ARM64EC implementations alike. */
+static int swap_vtable_slots(void **vtable, const int *slots, void *const *hooks, void **originals, int count,
+                             const char *const *names) {
+  int low = slots[0], high = slots[0];
+  for (int i = 1; i < count; i++) {
+    if (slots[i] < low) low = slots[i];
+    if (slots[i] > high) high = slots[i];
+  }
+  DWORD old;
+  if (!VirtualProtect(&vtable[low], (SIZE_T)(high - low + 1) * sizeof(void *), PAGE_READWRITE, &old)) {
+    log_msg("shaders: cannot unprotect the vtable at %p (%lu)", (void *)vtable, GetLastError());
+    return 0;
+  }
+  for (int i = 0; i < count; i++) {
+    originals[i] = vtable[slots[i]];
+    log_msg("shaders: vtable slot %d (%s) %p -> hook", slots[i], names[i], originals[i]);
+    vtable[slots[i]] = hooks[i]; /* an aligned pointer store, so callers see old or new */
+  }
+  VirtualProtect(&vtable[low], (SIZE_T)(high - low + 1) * sizeof(void *), old, &old);
+  return 1;
+}
+
+typedef void(WINAPI *get_context_fn)(void *device, void **context);
+typedef ULONG(WINAPI *release_fn)(void *object);
+
+enum { CREATE_IL = STAGE_COUNT, CREATE_BLEND, CREATE_COUNT };
+
+static void install_device_shader_hooks(void *device) {
+  if (!device || InterlockedCompareExchange(&shader_hooks_installed, 1, 0))
+    return;
+  void **vtable = *(void ***)device;
+  void *create_hooks[CREATE_COUNT] = {hook_create_VS, hook_create_GS, hook_create_GS_SO,       hook_create_PS,
+                                      hook_create_HS, hook_create_DS, hook_create_CS,          hook_create_input_layout,
+                                      hook_create_blend_state};
+  int create_slots[CREATE_COUNT];
+  const char *create_names[CREATE_COUNT];
+  void *create_originals[CREATE_COUNT];
+  for (int i = 0; i < STAGE_COUNT; i++) {
+    create_slots[i] = kStageSlots[i];
+    create_names[i] = kStageNames[i];
+  }
+  create_slots[CREATE_IL] = DEVICE_SLOT(CreateInputLayout);
+  create_names[CREATE_IL] = "il";
+  create_slots[CREATE_BLEND] = DEVICE_SLOT(CreateBlendState);
+  create_names[CREATE_BLEND] = "bs";
+  if (!swap_vtable_slots(vtable, create_slots, create_hooks, create_originals, CREATE_COUNT, create_names))
+    return;
+  for (int i = 0; i < STAGE_COUNT; i++) {
+    if (i == STAGE_GS_SO)
+      orig_create_gs_so = (create_gs_so_fn)create_originals[i];
+    else
+      orig_create_shader[i] = (create_shader_fn)create_originals[i];
+  }
+  orig_create_input_layout = (create_input_layout_fn)create_originals[CREATE_IL];
+  orig_create_blend_state = (create_blend_state_fn)create_originals[CREATE_BLEND];
+
+  /* GetImmediateContext adds a reference, so release it after hooking. */
+  void *context = NULL;
+  ((get_context_fn)vtable[DEVICE_SLOT(GetImmediateContext)])(device, &context);
+  if (!context) {
+    log_msg("shaders: no immediate context; bindings are not recorded");
+    return;
+  }
+  void **context_vtable = *(void ***)context;
+  void *context_hooks[CTX_COUNT] = {
+      hook_vs_set,      hook_gs_set,         hook_ps_set,       hook_layout_set,
+      hook_topology_set, hook_vertex_buffers_set, hook_targets_set, hook_targets_uavs_set,
+      hook_blend_set,   hook_draw,           hook_draw_indexed, hook_draw_indexed_instanced,
+      hook_draw_instanced, hook_draw_auto,   hook_draw_indexed_indirect, hook_draw_instanced_indirect};
+  swap_vtable_slots(context_vtable, kContextSlots, context_hooks, orig_context, CTX_COUNT, kContextNames);
+  ((release_fn)context_vtable[2])(context);
+}
+
+typedef HRESULT(WINAPI *create_device_fn)(void *adapter, int driver_type, HMODULE software, UINT flags,
+                                          const void *levels, UINT level_count, UINT sdk_version,
+                                          void **device, void *level, void **context);
+typedef HRESULT(WINAPI *create_device_swapchain_fn)(void *adapter, int driver_type, HMODULE software,
+                                                    UINT flags, const void *levels, UINT level_count,
+                                                    UINT sdk_version, const void *desc, void **swapchain,
+                                                    void **device, void *level, void **context);
+static create_device_fn orig_create_device;
+static create_device_swapchain_fn orig_create_device_swapchain;
+
+static HRESULT WINAPI hook_create_device(void *adapter, int driver_type, HMODULE software, UINT flags,
+                                         const void *levels, UINT level_count, UINT sdk_version, void **device,
+                                         void *level, void **context) {
+  HRESULT hr = orig_create_device(adapter, driver_type, software, flags, levels, level_count, sdk_version,
+                                  device, level, context);
+  if (SUCCEEDED(hr) && device && *device)
+    install_device_shader_hooks(*device);
+  return hr;
+}
+
+static HRESULT WINAPI hook_create_device_swapchain(void *adapter, int driver_type, HMODULE software,
+                                                   UINT flags, const void *levels, UINT level_count,
+                                                   UINT sdk_version, const void *desc, void **swapchain,
+                                                   void **device, void *level, void **context) {
+  HRESULT hr = orig_create_device_swapchain(adapter, driver_type, software, flags, levels, level_count,
+                                            sdk_version, desc, swapchain, device, level, context);
+  if (SUCCEEDED(hr) && device && *device)
+    install_device_shader_hooks(*device);
+  return hr;
+}
+
+/* Takes the two creation functions as arguments so that the test can pass fakes. */
+static int install_shader_capture(void *create_device, void *create_device_swapchain) {
+  int hooked = 0;
+  if (create_device && MH_CreateHook(create_device, hook_create_device, (void **)&orig_create_device) == MH_OK &&
+      MH_EnableHook(create_device) == MH_OK)
+    hooked++;
+  if (create_device_swapchain &&
+      MH_CreateHook(create_device_swapchain, hook_create_device_swapchain,
+                    (void **)&orig_create_device_swapchain) == MH_OK &&
+      MH_EnableHook(create_device_swapchain) == MH_OK)
+    hooked++;
+  log_msg("shaders: %d device creation hooks installed", hooked);
+  return hooked > 0;
 }
 
 /* ---------- setup -------------------------------------------------------- */
@@ -326,15 +1409,37 @@ static void setup(void) {
   open_log();
   cfg_uncap = env_int("SC6VRR_UNCAP", 0);
   cfg_gate = env_int("SC6VRR_GATE", 0);
+  cfg_measure = env_int("SC6VRR_MEASURE", 0);
+  cfg_frame_timers = env_int("SC6VRR_FRAME_TIMERS", 0);
+  cfg_thread_names = env_int("SC6VRR_THREAD_NAMES", 0);
   cfg_max_fps = (float)env_int("SC6VRR_MAX_FPS", 120);
-  log_msg("sc6vrr: uncap=%d gate=%d max_fps=%.0f", cfg_uncap, cfg_gate, cfg_max_fps);
+  log_msg("sc6vrr: uncap=%d gate=%d max_fps=%.0f measure=%d", cfg_uncap, cfg_gate, cfg_max_fps, cfg_measure);
 
   if (!exe_hash_matches()) {
     log_msg("sc6vrr: unknown exe build; no hooks installed");
     return;
   }
+  if (cfg_thread_names)
+    install_thread_name_observer();
   if (MH_Initialize() != MH_OK) {
     log_msg("sc6vrr: MH_Initialize failed");
+    return;
+  }
+  /* Shader capture hooks only d3d11.dll exports, so it does not depend on the
+   * engine prologue checks below and enables its own hooks. */
+  char dir[MAX_PATH];
+  DWORD dir_len = GetEnvironmentVariableA("SC6VRR_SHADER_DIR", dir, sizeof(dir));
+  if (dir_len && dir_len < sizeof(dir)) {
+    HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
+    if (!d3d11 || !shader_capture_open(dir) ||
+        !install_shader_capture((void *)GetProcAddress(d3d11, "D3D11CreateDevice"),
+                                (void *)GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain")))
+      log_msg("shaders: capture disabled (d3d11 %p, directory %s)", (void *)d3d11, dir);
+  }
+  /* Frame-rate changes are switched off for now (2026-10-16). The engine hooks
+   * below go in only with SC6VRR_FRAME_MODS=1, whatever the other settings say. */
+  if (!env_int("SC6VRR_FRAME_MODS", 0)) {
+    log_msg("sc6vrr: frame-rate modifications disabled; set SC6VRR_FRAME_MODS=1 to allow them");
     return;
   }
   if (!bytes_match(ADDR(ADDR_GET_MAX_TICK_RATE), "40534883ec500f2974244048") ||
@@ -344,9 +1449,27 @@ static void setup(void) {
   }
   MH_CreateHook(ADDR(ADDR_GET_MAX_TICK_RATE), hook_get_max_tick_rate, (void **)&orig_get_max_tick_rate);
   MH_CreateHook(ADDR(ADDR_UPDATE_TIME), hook_update_time, (void **)&orig_update_time);
-  if (cfg_gate && !install_gates()) {
-    log_msg("sc6vrr: gating disabled");
+  if (cfg_measure) {
+    if (!bytes_match(ADDR(ADDR_WORLD_TICK), "488bc455535657415441554156415748") ||
+        !bytes_match(ADDR(ADDR_BATTLE_COUNTER_INC), "ff05720d4304")) {
+      log_msg("measurement: world prologue or completed-counter INC mismatch; measurement disabled");
+      cfg_measure = 0;
+    } else {
+      MH_STATUS st = MH_CreateHook(ADDR(ADDR_WORLD_TICK), hook_world_tick, (void **)&orig_world_tick);
+      if (st != MH_OK) {
+        log_msg("measurement: world hook creation failed (%d); measurement disabled", st);
+        cfg_measure = 0;
+      }
+    }
+  }
+  if ((cfg_gate || cfg_measure) && !install_gates()) {
+    log_msg("sc6vrr: gating and measurement disabled");
     cfg_gate = 0;
+    cfg_measure = 0;
+  }
+  if (cfg_frame_timers && (!cfg_measure || !install_frame_timers())) {
+    cfg_frame_timers = 0;
+    log_msg("frame timers: disabled; baseline measurement remains available");
   }
   MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
   log_msg("sc6vrr: hooks enabled (%d)", st);
@@ -403,6 +1526,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     /* Runs before the game's main code; only the loader thread exists, so
      * patching code here cannot race with game threads. */
     setup();
+  } else if (reason == DLL_PROCESS_DETACH && thread_name_observer) {
+    RemoveVectoredExceptionHandler(thread_name_observer);
+    thread_name_observer = NULL;
   }
   return TRUE;
 }

@@ -4,9 +4,9 @@
 # Undo: delete Binaries/Win64/dinput8.dll and the AppDefaults key.
 set -euo pipefail
 here=${0:A:h}
-bottle=${SC6_BOTTLE:-Steam}
-win64=${SC6_WIN64:-$HOME/Games/SteamLibrary/steamapps/common/SoulCalibur 6/SoulcaliburVI/Binaries/Win64}
-wine=${CROSSOVER_APP:-/Applications/CrossOver.app}/Contents/SharedSupport/CrossOver/bin/wine
+bottle=${SC6_BOTTLE:-SC6-Rosetta}
+win64=${SC6_WIN64:-$HOME/Library/Application Support/CrossOver/Bottles/$bottle/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64}
+wine=${CROSSOVER_APP:-/Applications/CrossOver Preview.app}/Contents/SharedSupport/CrossOver/bin/wine
 [[ -f $here/build/dinput8.dll ]] || $here/build.sh
 cp $here/build/dinput8.dll "$win64/dinput8.dll"
 "$wine" --bottle $bottle reg add 'HKCU\Software\Wine\AppDefaults\SoulcaliburVI.exe\DllOverrides' \
