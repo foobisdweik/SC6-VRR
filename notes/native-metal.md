@@ -259,6 +259,53 @@ The user set the output to the display's 3456x2234 and `sg.ResolutionQuality=99`
 
 This session also raised the pixel shaders seen in real pairs to 1,246 of 1,936.
 
+## Xcode replay of frame C (2026-10-17)
+
+Xcode 27.2 replayed frame C's `.gputrace` (Summary: 3 command buffers, 107 render encoders, 5 compute and 2 blit encoders, 1,027 draws, 6 dispatches). Three findings:
+
+1. **No per-pass GPU timing.** Xcode reports "Profiling not available for Mesh pipelines". DXMT runs the frame's 8 geometry-shader draws as mesh pipelines, so the whole capture cannot be profiled. A frame without geometry-shader draws, or a capture with those draws removed, is needed for timings.
+2. **The output is upscaled to 6912x4468 with MetalFX.** The capture contains `MTLFXSpatialScaler` work, and the final drawable is 6912x4468 in `RGB10A2Unorm`. The display has 3456x2234 pixels, so this image has 4 times the display's pixels and must be scaled down again by the system. Cause (found later, in the profiling capture below): the SoulCalibur VI profile in `dxmt-SC6` (`src/util/config/config.cpp`) sets `d3d11.metalSpatialUpscale` to true and `d3d11.metalSpatialUpscaleFactor` to 2.0, so DXMT always doubles the game's output size. An earlier guess that the bottle's Retina mode doubles it was wrong. The user's later setting of 1728x1117 is upscaled to exactly the display's 3456x2234.
+3. **Bandwidth insights (550.64 MiB estimated savings in total):**
+   - Many full-size targets cannot use Apple's lossless compression, because their usage includes `ShaderWrite`. Examples: one 3424x2216 `RGBA16Float` target (59.06 MiB) and several 29.53 MiB targets. DXMT sets `ShaderWrite` only when the game creates a texture with `D3D11_BIND_UNORDERED_ACCESS` (`d3d11_resource_helper.cpp`), so the game asks for it.
+   - Some consecutive render encoders could be coalesced, for example encoder 69 (58.90 MiB) and encoder 16 (57.89 MiB).
+   - API usage: 2 empty blit encoders and 1 late buffer creation. Minor.
+
+## GPU profile of a frame without geometry-shader draws (2026-10-17, 10:05)
+
+Capture: `SoulcaliburVI_F.2721_10'05'37_10-17-26.gputrace` with frame log `frame-20261017-100537-0.tsv`. The game ran at 1728x1117 (scene targets 1712x1108), Training stage, through `shader-capture.sh launch-profile`. That mode sets `SC6VRR_SKIP_GS_DRAWS=1`, so the DLL drops every draw that has a geometry shader bound. The frame log records 8 skipped draws: passes 13, 16, and 18 (the 64x64 volume targets) and pass 56 (the 32x32 target). Xcode then profiled the replay ("Profile after replay").
+
+Limits of this profile:
+
+- The replayed image is black except for the UI. Inferred cause: pass 56 builds the color-grading table (a 32x32x32 volume), its draw was skipped, and tonemapping then reads an empty table. Passes before tonemapping are not affected. The tonemapping cost should be about the same, because the shader work does not change.
+- Xcode ran with profiler mode "Full", performance state "Medium", and overlapping execution. So the GPU was not at its highest clock, and the times below can differ from times during play.
+- Percentages are Xcode's encoder costs. The milliseconds are those percentages of the 16.53 ms effective GPU time. Pass numbers come from `tests/frame_passes.py`, matched to encoders by order, thumbnails, and targets.
+
+| Pass (frame log) | Role (inferred) | Cost | About |
+| --- | --- | --- | --- |
+| 5 | G-buffer (323 draws, 6 targets) | 33.31% | 5.5 ms |
+| 1 | Depth prepass (275 draws) | 5.77% + 0.56%, plus small encoders | 1.05 ms or more |
+| 19 | One compute dispatch, 214x121 groups, reads the G-buffer | 6.35% | 1.05 ms |
+| 10 | Full-size ambient occlusion | 5.01% | 0.83 ms |
+| 3 | Shadow depths, 4096x2048 | 4.88% | 0.81 ms |
+| 25 | 6 draws into a new full-size target (separate translucency) | 4.85% | 0.80 ms |
+| 17 | Lighting into scene color | 4.68% | 0.77 ms |
+| 24 | 20 draws into scene color (translucency) | 4.63% | 0.77 ms |
+| 14 | Full-screen lighting (2 draws) | 3.05% | 0.50 ms |
+| 54, 55 | Largest two bloom upsample steps | 1.24% + 1.25% | 0.41 ms |
+| 9, 15, 6, 29 | Half-size AO, shadow projection, custom depth, one full-size pass | 1.83%, 1.61%, 1.48%, 1.33% | 1.03 ms together |
+| 95, 57 | UI composite into the back buffer, tonemapping | 1.27%, 1.20% | 0.41 ms |
+| (DXMT) | Copy to the drawable after MetalFX | 1.33% | 0.22 ms |
+
+**MetalFX is the largest single cost after the G-buffer.** Xcode lists the MetalFX spatial scaling step outside the encoder list, with a total duration of 3.98 ms. Its output is 3456x2234 `RGB10A2Unorm`. Compare that with the 16.53 ms of all game encoders: the upscale adds about 24% on top. This is unverified as pure GPU time, because "total duration" can include time that overlaps other work.
+
+**DXMT waits for the GPU inside the frame.** Command buffer 2 holds the depth prepass. DXMT then calls `commit` and `waitUntilCompleted` on it before command buffer 3 starts. So the CPU stops until the prepass finishes. The reason is not known yet. A query result or a `Map` of a GPU resource would cause this. This costs CPU time, not GPU time.
+
+Possible next steps:
+
+1. Measure play with `d3d11.metalSpatialUpscale` off, so that the system scales 1728x1117 to the display. This removes the 3.98 ms MetalFX step, but the image is softer.
+2. Find which game call causes the mid-frame wait, from the frame log at the end of pass 1.
+3. G-buffer cost is a third of the frame. The two most expensive pixel shaders in the frame cost 8.21% and 7.60%. They are probably material shaders of that pass, but this is unverified. They are candidates for checking in the converted Metal code.
+
 ## What done means for the first milestone
 
 The native host draws one replayed battle frame that matches the DXMT capture within a stated image tolerance on an M1 Pro.

@@ -8,6 +8,9 @@
 #        tests/shader-capture.sh launch-frame  the same at normal speed, with
 #                                          DXMT's Metal capture on; F10 in the
 #                                          game logs one frame both ways
+#        tests/shader-capture.sh launch-profile  like launch-frame, but drops
+#                                          geometry-shader draws, so that Xcode
+#                                          can profile the Metal capture
 #        tests/shader-capture.sh frames    move Metal captures into the private
 #                                          folder and list the frame logs
 #        tests/shader-capture.sh summary   count the recorded shaders
@@ -46,7 +49,7 @@ case ${1:-} in
     print "installed: $dll"
     print "sha256: $(shasum -a 256 $dll | cut -d' ' -f1)"
     ;;
-  launch|launch-fast|launch-frame)
+  launch|launch-fast|launch-frame|launch-profile)
     game_running && { print "SC6 is already running."; exit 1; }
     cmp -s $dll $repo/dll/build/dinput8.dll || { print "Run '$0 install' first."; exit 1; }
     mkdir -p $out
@@ -59,11 +62,14 @@ case ${1:-} in
     # DXMT starts a Metal capture of the next frame when F10 is pressed, if
     # Metal capture is enabled and the executable name matches. It writes a
     # .gputrace into the game's working folder; the frames command moves it.
-    [[ $1 == launch-frame ]] && env_arg+=" MTL_CAPTURE_ENABLED=1 DXMT_CAPTURE_EXECUTABLE=SoulcaliburVI"
+    [[ $1 == launch-frame || $1 == launch-profile ]] &&
+      env_arg+=" MTL_CAPTURE_ENABLED=1 DXMT_CAPTURE_EXECUTABLE=SoulcaliburVI"
+    # Xcode cannot profile mesh pipelines, which DXMT uses for geometry shaders.
+    [[ $1 == launch-profile ]] && env_arg+=" SC6VRR_SKIP_GS_DRAWS=1"
     env_arg=${env_arg//\\/\\\\}
     "$wine" --bottle $bottle --env "$env_arg" --workdir "${exe:h}" --start "$exe" > $out/wine-$stamp.log 2>&1 &
     print "Launched in $bottle. Log: $out/sc6vrr-$stamp.log"
-    if [[ $1 == launch-frame ]]; then
+    if [[ $1 == launch-frame || $1 == launch-profile ]]; then
       print "In a battle, press F10 once (on a Mac keyboard, fn+F10). Then quit and run: $0 frames"
     else
       print "Visit the scenes to record: menus, Training on several stages, and several characters."

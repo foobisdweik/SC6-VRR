@@ -544,6 +544,22 @@ int main(void) {
   assert(!fgets(line, sizeof(line), f));
   fclose(f);
 
+  /* SC6VRR_SKIP_GS_DRAWS: draws with a geometry shader bound are dropped only
+   * when the option is on. */
+  set_shader_fn gs_set = (set_shader_fn)cvt[CONTEXT_SLOT(GSSetShader)];
+  unsigned draws_before = fake_draws;
+  gs_set(&fake_context, (void *)0xBEEF00, NULL, 0);
+  draw(&fake_context, 3, 0);                        /* option off: passes through */
+  assert(fake_draws == draws_before + 1);
+  cfg_skip_gs_draws = 1;
+  draw(&fake_context, 3, 0);                        /* option on, geometry shader bound: dropped */
+  draw_indexed(&fake_context, 3, 0, 0);
+  assert(fake_draws == draws_before + 1 && gs_draws_skipped == 2);
+  gs_set(&fake_context, NULL, NULL, 0);
+  draw(&fake_context, 3, 0);                        /* no geometry shader: passes through */
+  assert(fake_draws == draws_before + 2);
+  cfg_skip_gs_draws = 0;
+
   printf("shader capture test passed: %s\n", dir);
   return 0;
 }

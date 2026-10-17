@@ -25,6 +25,7 @@
  *   SC6VRR_SHADER_DIR=<Windows path> records every shader the game creates,
  *   its input layouts, and the shader combinations that its draws use. With
  *   it, F10 in the game also logs one frame's calls to <dir>\frames\.
+ *   SC6VRR_SKIP_GS_DRAWS=1 drops geometry-shader draws, for GPU profiling only.
  *   SC6VRR_FRAME_MODS=1 is required for every engine hook above (uncap, gate,
  *   measure). Without it, the DLL changes no frame timing.
  */
@@ -1454,6 +1455,23 @@ static void note_targets(UINT count, void *const *rtvs, void *dsv) {
   }
 }
 
+/* With SC6VRR_SKIP_GS_DRAWS=1, draws issued while a geometry shader is bound
+ * are dropped. DXMT runs those draws as Metal mesh pipelines, and Xcode cannot
+ * profile a capture that contains mesh pipelines. Dropping them changes the
+ * image, so use this only for GPU profiling captures. */
+static int cfg_skip_gs_draws;
+static uint64_t gs_draws_skipped;
+
+static int skip_gs_draw(void) {
+  if (!cfg_skip_gs_draws || bound.gs == ID_NONE)
+    return 0;
+  if (++gs_draws_skipped == 1)
+    log_msg("shaders: skipping draws with a geometry shader bound (SC6VRR_SKIP_GS_DRAWS=1)");
+  if (FRAME_LOGGING_NOW)
+    frame_line("SkippedDraw\treason=geometry shader bound");
+  return 1;
+}
+
 static void WINAPI hook_vs_set(void *ctx, void *shader, void *const *instances, UINT count) {
   bound.vs = object_lookup(shader, NULL);
   ((set_shader_fn)orig_context[CTX_VS_SET])(ctx, shader, instances, count);
@@ -1522,6 +1540,8 @@ static void WINAPI hook_draw(void *ctx, UINT count, UINT start) {
     snprintf(args, sizeof(args), "count=%u start=%u", count, start);
     frame_draw("Draw", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_fn)orig_context[CTX_DRAW])(ctx, count, start);
 }
 static void WINAPI hook_draw_indexed(void *ctx, UINT count, UINT start, INT base) {
@@ -1531,6 +1551,8 @@ static void WINAPI hook_draw_indexed(void *ctx, UINT count, UINT start, INT base
     snprintf(args, sizeof(args), "count=%u start=%u base=%d", count, start, base);
     frame_draw("DrawIndexed", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_indexed_fn)orig_context[CTX_DRAW_INDEXED])(ctx, count, start, base);
 }
 static void WINAPI hook_draw_indexed_instanced(void *ctx, UINT count, UINT instances, UINT start, INT base,
@@ -1541,6 +1563,8 @@ static void WINAPI hook_draw_indexed_instanced(void *ctx, UINT count, UINT insta
     snprintf(args, sizeof(args), "count=%u instances=%u start=%u base=%d", count, instances, start, base);
     frame_draw("DrawIndexedInstanced", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_indexed_instanced_fn)orig_context[CTX_DRAW_INDEXED_INSTANCED])(ctx, count, instances, start, base,
                                                                         start_instance);
 }
@@ -1551,6 +1575,8 @@ static void WINAPI hook_draw_instanced(void *ctx, UINT count, UINT instances, UI
     snprintf(args, sizeof(args), "count=%u instances=%u start=%u", count, instances, start);
     frame_draw("DrawInstanced", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_instanced_fn)orig_context[CTX_DRAW_INSTANCED])(ctx, count, instances, start, start_instance);
 }
 static void WINAPI hook_draw_auto(void *ctx) {
@@ -1560,6 +1586,8 @@ static void WINAPI hook_draw_auto(void *ctx) {
     snprintf(args, sizeof(args), "-");
     frame_draw("DrawAuto", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_auto_fn)orig_context[CTX_DRAW_AUTO])(ctx);
 }
 static void WINAPI hook_draw_indexed_indirect(void *ctx, void *args, UINT offset) {
@@ -1569,6 +1597,8 @@ static void WINAPI hook_draw_indexed_indirect(void *ctx, void *args, UINT offset
     snprintf(args, sizeof(args), "offset=%u", offset);
     frame_draw("DrawIndexedInstancedIndirect", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_indirect_fn)orig_context[CTX_DRAW_INDEXED_INDIRECT])(ctx, args, offset);
 }
 static void WINAPI hook_draw_instanced_indirect(void *ctx, void *args, UINT offset) {
@@ -1578,6 +1608,8 @@ static void WINAPI hook_draw_instanced_indirect(void *ctx, void *args, UINT offs
     snprintf(args, sizeof(args), "offset=%u", offset);
     frame_draw("DrawInstancedIndirect", args);
   }
+  if (skip_gs_draw())
+    return;
   ((draw_indirect_fn)orig_context[CTX_DRAW_INSTANCED_INDIRECT])(ctx, args, offset);
 }
 
@@ -1970,6 +2002,7 @@ static void setup(void) {
    * engine prologue checks below and enables its own hooks. */
   char dir[MAX_PATH];
   DWORD dir_len = GetEnvironmentVariableA("SC6VRR_SHADER_DIR", dir, sizeof(dir));
+  cfg_skip_gs_draws = env_int("SC6VRR_SKIP_GS_DRAWS", 0);
   if (dir_len && dir_len < sizeof(dir)) {
     HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll"), dxgi = NULL;
     if (!d3d11 || !shader_capture_open(dir) ||
