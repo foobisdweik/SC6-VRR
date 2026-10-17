@@ -1401,7 +1401,7 @@ enum {
   CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_CS_SET, CTX_PS_SRV, CTX_CS_SRV,
   CTX_CS_UAV, CTX_CLEAR_RTV, CTX_CLEAR_DSV, CTX_VIEWPORTS, CTX_DISPATCH, CTX_DISPATCH_INDIRECT, CTX_COPY_RESOURCE,
   CTX_COPY_REGION, CTX_RESOLVE, CTX_DEPTH_STATE, CTX_RASTER_STATE, CTX_VS_SRV, CTX_PS_SAMPLERS, CTX_VS_SAMPLERS,
-  CTX_CS_SAMPLERS, CTX_COUNT
+  CTX_CS_SAMPLERS, CTX_GET_DATA, CTX_MAP, CTX_FLUSH, CTX_COUNT
 };
 static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(VSSetShader), CONTEXT_SLOT(GSSetShader), CONTEXT_SLOT(PSSetShader),
@@ -1415,7 +1415,8 @@ static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(Dispatch), CONTEXT_SLOT(DispatchIndirect), CONTEXT_SLOT(CopyResource),
     CONTEXT_SLOT(CopySubresourceRegion), CONTEXT_SLOT(ResolveSubresource), CONTEXT_SLOT(OMSetDepthStencilState),
     CONTEXT_SLOT(RSSetState), CONTEXT_SLOT(VSSetShaderResources), CONTEXT_SLOT(PSSetSamplers),
-    CONTEXT_SLOT(VSSetSamplers), CONTEXT_SLOT(CSSetSamplers)};
+    CONTEXT_SLOT(VSSetSamplers), CONTEXT_SLOT(CSSetSamplers), CONTEXT_SLOT(GetData), CONTEXT_SLOT(Map),
+    CONTEXT_SLOT(Flush)};
 static const char *const kContextNames[CTX_COUNT] = {
     "VSSetShader", "GSSetShader", "PSSetShader", "IASetInputLayout", "IASetPrimitiveTopology",
     "IASetVertexBuffers", "OMSetRenderTargets", "OMSetRenderTargetsAndUnorderedAccessViews", "OMSetBlendState",
@@ -1423,7 +1424,8 @@ static const char *const kContextNames[CTX_COUNT] = {
     "DrawInstancedIndirect", "CSSetShader", "PSSetShaderResources", "CSSetShaderResources",
     "CSSetUnorderedAccessViews", "ClearRenderTargetView", "ClearDepthStencilView", "RSSetViewports", "Dispatch",
     "DispatchIndirect", "CopyResource", "CopySubresourceRegion", "ResolveSubresource", "OMSetDepthStencilState",
-    "RSSetState", "VSSetShaderResources", "PSSetSamplers", "VSSetSamplers", "CSSetSamplers"};
+    "RSSetState", "VSSetShaderResources", "PSSetSamplers", "VSSetSamplers", "CSSetSamplers", "GetData", "Map",
+    "Flush"};
 static void *orig_context[CTX_COUNT];
 
 /* Reads the formats of the bound views. A view's format can differ from its
@@ -1758,6 +1760,111 @@ static void WINAPI hook_cs_samplers_set(void *ctx, UINT start, UINT count, void 
   ((set_samplers_fn)orig_context[CTX_CS_SAMPLERS])(ctx, start, count, samplers);
 }
 
+/* Waits on the game's render thread. UE4 reads occlusion query results with a
+ * loop that calls GetData until it returns S_OK, and DXMT blocks inside Map
+ * until the GPU is done with a staging resource. Either one stops the thread
+ * that encodes the next frame. A query wait runs from the first S_FALSE to the
+ * S_OK on the same query, and Present ends any open wait, so one counted wait
+ * never spans two frames. */
+typedef HRESULT(WINAPI *get_data_fn)(void *ctx, void *async, void *data, UINT size, UINT flags);
+typedef HRESULT(WINAPI *map_fn)(void *ctx, void *resource, UINT sub, D3D11_MAP type, UINT flags,
+                                D3D11_MAPPED_SUBRESOURCE *out);
+typedef void(WINAPI *flush_fn)(void *ctx);
+/* D3D11_QUERY kinds 0 to 15. ID3D11Predicate and ID3D11Counter keep GetDesc in
+ * the same vtable slot, with a two-UINT description whose first field is the
+ * kind, so the same call reads them. Other values (counter IDs) count as
+ * QUERY_OTHER. */
+_Static_assert(offsetof(ID3D11QueryVtbl, GetDesc) / sizeof(void *) == 8, "unexpected ID3D11Query layout");
+typedef void(WINAPI *query_desc_fn)(void *query, D3D11_QUERY_DESC *desc);
+enum { QUERY_KINDS = 16, QUERY_OTHER = QUERY_KINDS };
+static const char *const kQueryKindNames[QUERY_KINDS + 1] = {
+    "event", "occlusion", "timestamp", "timestamp-disjoint", "pipeline-statistics", "occlusion-predicate",
+    "so-statistics", "so-overflow-predicate", "so-statistics-0", "so-overflow-0", "so-statistics-1",
+    "so-overflow-1", "so-statistics-2", "so-overflow-2", "so-statistics-3", "so-overflow-3", "other"};
+static struct {
+  uint64_t frames, polls, not_ready, query_waits, maps, flushes;
+  double query_ms, query_max_ms, map_ms, map_max_ms;
+  uint64_t kind_waits[QUERY_KINDS + 1];
+  double kind_ms[QUERY_KINDS + 1];
+} waits;
+
+static unsigned query_kind(void *query) {
+  D3D11_QUERY_DESC desc = {0};
+  ((query_desc_fn)(*(void ***)query)[offsetof(ID3D11QueryVtbl, GetDesc) / sizeof(void *)])(query, &desc);
+  return (unsigned)desc.Query < QUERY_KINDS ? (unsigned)desc.Query : QUERY_OTHER;
+}
+static void *waiting_query;
+static double waiting_since;
+static unsigned waiting_polls;
+#define WAIT_REPORT_FRAMES 120
+
+static HRESULT WINAPI hook_get_data(void *ctx, void *async, void *data, UINT size, UINT flags) {
+  double t0 = qpc_seconds();
+  HRESULT hr = ((get_data_fn)orig_context[CTX_GET_DATA])(ctx, async, data, size, flags);
+  waits.polls++;
+  if (hr == S_FALSE) {
+    waits.not_ready++;
+    if (async != waiting_query)
+      waiting_query = async, waiting_since = t0, waiting_polls = 0;
+    waiting_polls++;
+  } else if (async == waiting_query) {
+    double ms = (qpc_seconds() - waiting_since) * 1000.0;
+    waits.query_waits++;
+    waits.query_ms += ms;
+    if (ms > waits.query_max_ms) waits.query_max_ms = ms;
+    unsigned kind = query_kind(async);
+    waits.kind_waits[kind]++;
+    waits.kind_ms[kind] += ms;
+    if (FRAME_LOGGING_NOW)
+      frame_line("QueryWait\tkind=%s\tms=%.3f\tpolls=%u\tflags=0x%x\tsize=%u", kQueryKindNames[kind], ms,
+                 waiting_polls + 1, flags, size);
+    waiting_query = NULL;
+  }
+  return hr;
+}
+static HRESULT WINAPI hook_map(void *ctx, void *resource, UINT sub, D3D11_MAP type, UINT flags,
+                               D3D11_MAPPED_SUBRESOURCE *out) {
+  double t0 = qpc_seconds();
+  HRESULT hr = ((map_fn)orig_context[CTX_MAP])(ctx, resource, sub, type, flags, out);
+  double ms = (qpc_seconds() - t0) * 1000.0;
+  waits.maps++;
+  waits.map_ms += ms;
+  if (ms > waits.map_max_ms) waits.map_max_ms = ms;
+  if (FRAME_LOGGING_NOW) {
+    char r[160];
+    describe_resource(resource, r, sizeof(r));
+    frame_line("Map\tresource=%s\tsub=%u\ttype=%u\tflags=0x%x\tms=%.3f\thr=0x%08lx", r, sub, (unsigned)type, flags,
+               ms, (unsigned long)hr);
+  }
+  return hr;
+}
+static void WINAPI hook_flush(void *ctx) {
+  waits.flushes++;
+  if (FRAME_LOGGING_NOW)
+    frame_line("Flush");
+  ((flush_fn)orig_context[CTX_FLUSH])(ctx);
+}
+
+/* Called at every Present: ends an open query wait and logs averages. */
+static void waits_present(void) {
+  waiting_query = NULL;
+  if (++waits.frames < WAIT_REPORT_FRAMES)
+    return;
+  double n = (double)waits.frames;
+  char kinds[512] = "";
+  size_t used = 0;
+  for (int k = 0; k <= QUERY_KINDS && used < sizeof(kinds); k++)
+    if (waits.kind_waits[k])
+      used += (size_t)snprintf(kinds + used, sizeof(kinds) - used, "%s%s %.2f waits %.3f ms", used ? ", " : "",
+                               kQueryKindNames[k], waits.kind_waits[k] / n, waits.kind_ms[k] / n);
+  log_msg("waits: per frame over %llu frames: query waits %.3f ms (%.2f waits, longest %.3f ms; by kind: %s), "
+          "GetData %.1f calls (%.1f not ready), Map %.3f ms (%.1f calls, longest %.3f ms), Flush %.2f calls",
+          (unsigned long long)waits.frames, waits.query_ms / n, waits.query_waits / n, waits.query_max_ms,
+          used ? kinds : "none", waits.polls / n, waits.not_ready / n, waits.map_ms / n, waits.maps / n,
+          waits.map_max_ms, waits.flushes / n);
+  memset(&waits, 0, sizeof(waits));
+}
+
 /* Replaces vtable pointers instead of patching the methods' code. Under
  * CrossOver Preview with FEX, d3d11.dll is ARM64EC: its methods are native
  * ARM64 code, so an x64 jump written over them is an illegal instruction
@@ -1803,6 +1910,7 @@ static volatile LONG factory_hooked, present_hooked;
 
 static HRESULT WINAPI hook_present(void *swapchain, UINT sync_interval, UINT flags) {
   frame_present();
+  waits_present();
   return orig_present(swapchain, sync_interval, flags);
 }
 
@@ -1923,7 +2031,7 @@ static void install_device_shader_hooks(void *device) {
       hook_clear_rtv,   hook_clear_dsv,      hook_viewports_set, hook_dispatch,
       hook_dispatch_indirect, hook_copy_resource, hook_copy_region, hook_resolve,
       hook_depth_state_set, hook_raster_state_set, hook_vs_srv_set, hook_ps_samplers_set,
-      hook_vs_samplers_set, hook_cs_samplers_set};
+      hook_vs_samplers_set, hook_cs_samplers_set, hook_get_data, hook_map, hook_flush};
   swap_vtable_slots(context_vtable, kContextSlots, context_hooks, orig_context, CTX_COUNT, kContextNames);
   ((release_fn)context_vtable[2])(context);
 }

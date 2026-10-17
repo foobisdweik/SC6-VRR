@@ -55,6 +55,9 @@ case ${1:-} in
     mkdir -p $out
     stamp=$(date +%Y%m%d-%H%M%S)
     env_arg="SC6VRR_SHADER_DIR=\"$(to_windows $out)\" SC6VRR_LOG=\"$(to_windows $out/sc6vrr-$stamp.log)\""
+    # MetalFX upscaling cost about 4 ms per frame in the 2026-10-17 profile.
+    # DXMT turns it on only when this is "1", so "0" overrides a shell export.
+    env_arg+=" DXMT_METALFX_SPATIAL_SWAPCHAIN=0"
     # launch-fast removes the 60 fps cap without the 60 Hz battle gate. The
     # battle advances one step per rendered frame, so it runs faster than
     # normal, limited by how fast the game renders (about 80 fps measured).
