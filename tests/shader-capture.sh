@@ -3,8 +3,8 @@
 #
 # Usage: tests/shader-capture.sh install   copy the sc6vrr DLL into the game folder
 #        tests/shader-capture.sh launch    start SC6 with capture on
-#        tests/shader-capture.sh launch-fast  the same, with the frame rate and
-#                                          the battle speed uncapped
+#        tests/shader-capture.sh launch-unlocked  the same, with unlocked rendering
+#                                          and game logic at 60 Hz
 #        tests/shader-capture.sh launch-frame  the same at normal speed, with
 #                                          DXMT's Metal capture on; F10 in the
 #                                          game logs one frame both ways
@@ -18,7 +18,7 @@
 #
 # Runs in the CrossOver Preview x86-64 bottle (Rosetta 2), the only test bottle
 # since 2026-10-16. SC6_BOTTLE selects another. The DLL changes no frame timing:
-# SC6VRR_FRAME_MODS is set only by launch-fast. Output goes to the private
+# SC6VRR_FRAME_MODS is set only by launch-unlocked (or its old alias, launch-fast). Output goes to the private
 # investigation directory, outside Git, because it is game material.
 set -euo pipefail
 
@@ -49,16 +49,21 @@ case ${1:-} in
     print "installed: $dll"
     print "sha256: $(shasum -a 256 $dll | cut -d' ' -f1)"
     ;;
-  launch|launch-fast|launch-frame|launch-profile)
+  launch|launch-unlocked|launch-fast|launch-frame|launch-profile)
     game_running && { print "SC6 is already running."; exit 1; }
     cmp -s $dll $repo/dll/build/dinput8.dll || { print "Run '$0 install' first."; exit 1; }
     mkdir -p $out
     stamp=$(date +%Y%m%d-%H%M%S)
     env_arg="SC6VRR_SHADER_DIR=\"$(to_windows $out)\" SC6VRR_LOG=\"$(to_windows $out/sc6vrr-$stamp.log)\""
-    # launch-fast removes the 60 fps cap without the 60 Hz battle gate. The
-    # battle advances one step per rendered frame, so it runs faster than
-    # normal, limited by how fast the game renders (about 80 fps measured).
-    [[ $1 == launch-fast ]] && env_arg+=" SC6VRR_FRAME_MODS=1 SC6VRR_UNCAP=1 SC6VRR_MAX_FPS=240"
+    # MetalFX upscaling cost about 4 ms per frame in the 2026-10-17 profile.
+    # DXMT turns it on only when this is "1", so "0" overrides a shell export.
+    env_arg+=" DXMT_METALFX_SPATIAL_SWAPCHAIN=0"
+    # The unlock always keeps world logic at 60 Hz. launch-fast is an alias.
+    if [[ $1 == launch-unlocked || $1 == launch-fast ]]; then
+      env_arg+=" SC6VRR_FRAME_MODS=1 SC6VRR_UNCAP=1 SC6VRR_MAX_FPS=0 SC6VRR_GATE=1 SC6VRR_MEASURE=1"
+    else
+      env_arg+=" SC6VRR_FRAME_MODS=0"
+    fi
     # DXMT starts a Metal capture of the next frame when F10 is pressed, if
     # Metal capture is enabled and the executable name matches. It writes a
     # .gputrace into the game's working folder; the frames command moves it.

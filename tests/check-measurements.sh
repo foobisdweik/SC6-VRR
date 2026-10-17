@@ -8,6 +8,8 @@ zsh -n tests/run.sh tests/summarize.sh tests/mark.sh
 dll/build.sh
 clang -std=c11 -Wall -Wextra -Werror tests/test_durations.c -o dll/build/test-durations
 dll/build/test-durations
+clang -std=c11 -Wall -Wextra -Werror tests/test_fixed_step.c -o dll/build/test-fixed-step
+dll/build/test-fixed-step
 x86_64-w64-mingw32-gcc -O2 -Wall -o dll/build/test-clock-cave.exe \
   tests/test_clock_cave.c third_party/minhook/src/buffer.c third_party/minhook/src/hook.c \
   third_party/minhook/src/trampoline.c third_party/minhook/src/hde/hde64.c \

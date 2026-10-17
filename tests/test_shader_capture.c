@@ -191,6 +191,31 @@ static __attribute__((noinline)) void WINAPI fake_set_list(void *ctx, UINT start
   (void)ctx, (void)start, (void)n, (void)items;
   fake_frame_calls++;
 }
+/* Fake query, Map, and Flush for the wait counters. GetData reports "not
+ * ready" fake_not_ready times, then S_OK. */
+static unsigned fake_not_ready, fake_maps, fake_flushes;
+static __attribute__((noinline)) HRESULT WINAPI fake_get_data(void *ctx, void *q, void *data, UINT size, UINT flags) {
+  (void)ctx, (void)q, (void)data, (void)size, (void)flags;
+  if (fake_not_ready) {
+    fake_not_ready--;
+    Sleep(2);
+    return S_FALSE;
+  }
+  return S_OK;
+}
+static __attribute__((noinline)) HRESULT WINAPI fake_map(void *ctx, void *r, UINT sub, D3D11_MAP type, UINT flags,
+                                                         D3D11_MAPPED_SUBRESOURCE *out) {
+  (void)ctx, (void)r, (void)sub, (void)type, (void)flags, (void)out;
+  fake_maps++;
+  return S_OK;
+}
+static __attribute__((noinline)) void WINAPI fake_flush(void *ctx) { (void)ctx, fake_flushes++; }
+/* A fake event query: only GetDesc is needed. */
+static __attribute__((noinline)) void WINAPI fake_query_desc(void *q, D3D11_QUERY_DESC *desc) {
+  (void)q, desc->Query = D3D11_QUERY_EVENT, desc->MiscFlags = 0;
+}
+static void *fake_query_vtable[9];
+static struct { void **vtable; } fake_query = {fake_query_vtable};
 static int fake_key;
 static int fake_key_down(void) { return fake_key; }
 
@@ -294,6 +319,9 @@ int main(void) {
   fake_context_vtable[CONTEXT_SLOT(RSSetState)] = fake_set_state;
   fake_context_vtable[CONTEXT_SLOT(VSSetShaderResources)] = fake_set_list;
   fake_context_vtable[CONTEXT_SLOT(PSSetSamplers)] = fake_set_list;
+  fake_context_vtable[CONTEXT_SLOT(GetData)] = fake_get_data;
+  fake_context_vtable[CONTEXT_SLOT(Map)] = fake_map;
+  fake_context_vtable[CONTEXT_SLOT(Flush)] = fake_flush;
   fake_factory_vtable[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)] = fake_create_swapchain;
 
   char dir[MAX_PATH], path[MAX_PATH + 128];
@@ -559,6 +587,29 @@ int main(void) {
   draw(&fake_context, 3, 0);                        /* no geometry shader: passes through */
   assert(fake_draws == draws_before + 2);
   cfg_skip_gs_draws = 0;
+
+  /* Wait counters: a query polled until ready counts one wait from its first
+   * "not ready" result; Present ends a wait that is still open. */
+  get_data_fn get_data = (get_data_fn)cvt[CONTEXT_SLOT(GetData)];
+  map_fn map = (map_fn)cvt[CONTEXT_SLOT(Map)];
+  flush_fn flush = (flush_fn)cvt[CONTEXT_SLOT(Flush)];
+  memset(&waits, 0, sizeof(waits));
+  fake_query_vtable[8] = fake_query_desc;
+  void *query = &fake_query;
+  fake_not_ready = 3;
+  while (get_data(&fake_context, query, NULL, 0, 0) == S_FALSE) {}
+  assert(waits.polls == 4 && waits.not_ready == 3 && waits.query_waits == 1);
+  assert(waits.query_ms >= 5.0 && waits.query_max_ms == waits.query_ms);
+  assert(waits.kind_waits[D3D11_QUERY_EVENT] == 1 && waits.kind_ms[D3D11_QUERY_EVENT] == waits.query_ms);
+  assert(get_data(&fake_context, query, NULL, 0, 0) == S_OK && waits.query_waits == 1); /* ready at once: no wait */
+  fake_not_ready = 1;
+  assert(get_data(&fake_context, query, NULL, 0, 0) == S_FALSE);
+  present(&fake_swapchain, 1, 0);                   /* the open wait ends uncounted */
+  assert(get_data(&fake_context, query, NULL, 0, 0) == S_OK && waits.query_waits == 1);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  assert(map(&fake_context, (void *)0xABC, 0, D3D11_MAP_READ, 0, &mapped) == S_OK);
+  flush(&fake_context);
+  assert(fake_maps == 1 && waits.maps == 1 && fake_flushes == 1 && waits.flushes == 1 && waits.frames == 1);
 
   printf("shader capture test passed: %s\n", dir);
   return 0;

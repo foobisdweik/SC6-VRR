@@ -49,7 +49,11 @@ The `dinput8.dll` hook now records shaders when `SC6VRR_SHADER_DIR` is set:
 2. When the game creates its first device, it replaces the seven `Create*Shader` pointers in the device's vtable (slots 12 to 18). It does not patch the methods' code. In the FEX bottle, `d3d11.dll` is ARM64EC, so the first build's x64 code patch crashed the game with an illegal instruction (`0xC000001D` at `d3d11.dll+0x51bc`, the pixel-shader method).
 3. Each unique blob goes to `dxbc/<sha256>.dxbc`. Each call adds a line with stage, shader model, size, hash, and result code to `index-<time>-<pid>.tsv`.
 
-Frame-rate changes are off. The engine hooks install only with `SC6VRR_FRAME_MODS=1`, so test cases 10 to 19 need that variable before they work again.
+Frame changes require `SC6VRR_FRAME_MODS=1`. The cases that request frame changes now set that variable.
+For unlocked rendering with game logic at 60 Hz, use `dll/launch.sh`.
+For shader capture with the same timing, use `tests/shader-capture.sh launch-unlocked`.
+The old `launch-fast` name is an alias for that command. It now preserves the normal game speed.
+See [the timing implementation](unlocked-rendering.md).
 
 `tests/test_shader_capture.c` checks the parser, the hash, deduplication, the passed-through result codes, and the stored bytes with a fake device. It passes in the CrossOver Preview `SC6-fex` bottle.
 
@@ -142,7 +146,8 @@ The fake-device test passes in `SC6-Rosetta`. It covers deduplication, unused st
 ### Fast-mode session (2026-10-17, 01:50 to 02:11)
 
 The user ran CPU-versus-CPU battles with `tests/shader-capture.sh launch-fast` at maximum settings.
-Fast mode sets `SC6VRR_FRAME_MODS=1` and `SC6VRR_UNCAP=1` without the 60 Hz gate, so the battle advanced one step per rendered frame, at about 190 to 240 fps.
+In that earlier run, fast mode omitted the 60 Hz gate, so battle logic advanced at about 190 to 240 Hz.
+The current launcher always enables the 60 Hz world gate when it unlocks rendering.
 
 Across all `SC6-Rosetta` runs after this session:
 
@@ -264,7 +269,7 @@ This session also raised the pixel shaders seen in real pairs to 1,246 of 1,936.
 Xcode 27.2 replayed frame C's `.gputrace` (Summary: 3 command buffers, 107 render encoders, 5 compute and 2 blit encoders, 1,027 draws, 6 dispatches). Three findings:
 
 1. **No per-pass GPU timing.** Xcode reports "Profiling not available for Mesh pipelines". DXMT runs the frame's 8 geometry-shader draws as mesh pipelines, so the whole capture cannot be profiled. A frame without geometry-shader draws, or a capture with those draws removed, is needed for timings.
-2. **The output is upscaled to 6912x4468 with MetalFX.** The capture contains `MTLFXSpatialScaler` work, and the final drawable is 6912x4468 in `RGB10A2Unorm`. The display has 3456x2234 pixels, so this image has 4 times the display's pixels and must be scaled down again by the system. Cause (found later, in the profiling capture below): the SoulCalibur VI profile in `dxmt-SC6` (`src/util/config/config.cpp`) sets `d3d11.metalSpatialUpscale` to true and `d3d11.metalSpatialUpscaleFactor` to 2.0, so DXMT always doubles the game's output size. An earlier guess that the bottle's Retina mode doubles it was wrong. The user's later setting of 1728x1117 is upscaled to exactly the display's 3456x2234.
+2. **The output is upscaled to 6912x4468 with MetalFX.** The capture contains `MTLFXSpatialScaler` work, and the final drawable is 6912x4468 in `RGB10A2Unorm`. The display has 3456x2234 pixels, so this image has 4 times the display's pixels and must be scaled down again by the system. Cause (found later): the user's `~/.zshrc` exported `DXMT_METALFX_SPATIAL_SWAPCHAIN=1`, and every launch from a shell inherited it. DXMT then doubles the output size (its default factor is 2). The SC6-Rosetta bottle loads CrossOver Preview's stock DXMT, not the `dxmt-SC6` build, so the SC6 profile in `dxmt-SC6` is not the cause. An earlier guess that the bottle's Retina mode doubles it was wrong too. The user's later setting of 1728x1117 is upscaled to exactly the display's 3456x2234.
 3. **Bandwidth insights (550.64 MiB estimated savings in total):**
    - Many full-size targets cannot use Apple's lossless compression, because their usage includes `ShaderWrite`. Examples: one 3424x2216 `RGBA16Float` target (59.06 MiB) and several 29.53 MiB targets. DXMT sets `ShaderWrite` only when the game creates a texture with `D3D11_BIND_UNORDERED_ACCESS` (`d3d11_resource_helper.cpp`), so the game asks for it.
    - Some consecutive render encoders could be coalesced, for example encoder 69 (58.90 MiB) and encoder 16 (57.89 MiB).
@@ -298,15 +303,65 @@ Limits of this profile:
 
 **MetalFX is the largest single cost after the G-buffer.** Xcode lists the MetalFX spatial scaling step outside the encoder list, with a total duration of 3.98 ms. Its output is 3456x2234 `RGB10A2Unorm`. Compare that with the 16.53 ms of all game encoders: the upscale adds about 24% on top. This is unverified as pure GPU time, because "total duration" can include time that overlaps other work.
 
-**DXMT waits for the GPU inside the frame.** Command buffer 2 holds the depth prepass. DXMT then calls `commit` and `waitUntilCompleted` on it before command buffer 3 starts. So the CPU stops until the prepass finishes. The reason is not known yet. A query result or a `Map` of a GPU resource would cause this. This costs CPU time, not GPU time.
+**The mid-frame `waitUntilCompleted` does not stop the game.** Command buffer 2 holds the depth prepass, and the capture shows `commit` and then `waitUntilCompleted` on it. An earlier reading of this as a CPU stall was wrong. In DXMT (`src/dxmt/dxmt_command_queue.cpp`), `waitUntilCompleted` runs on a separate thread (`dxmt-finish-thread`) that only recycles finished command buffers. The split into two command buffers comes from a flush: the last draws before it are small boxes with no pixel shader, which fits UE4's occlusion queries. UE4 is inferred to ask for a flush after it issues them.
+
+The game's render thread can still wait in two places in DXMT:
+
+1. `Map` of a staging resource blocks until the GPU is done with it (`d3d11_context_imm.cpp`, counted as "Sync" on the DXMT HUD).
+2. `GetData` on a query does not block, but it returns "not ready" until the GPU has finished. UE4 is inferred to poll last frame's occlusion results in a loop until they are ready.
+
+The DLL now measures both (see below).
 
 Possible next steps:
 
-1. Measure play with `d3d11.metalSpatialUpscale` off, so that the system scales 1728x1117 to the display. This removes the 3.98 ms MetalFX step, but the image is softer.
-2. Find which game call causes the mid-frame wait, from the frame log at the end of pass 1.
+1. Done 2026-10-17: MetalFX is off. The `~/.zshrc` line is commented out, and `tests/run.sh` and `tests/shader-capture.sh` pass `DXMT_METALFX_SPATIAL_SWAPCHAIN=0`. DXMT enables MetalFX only when the value is `1`.
+2. Measure the render thread's waits in `GetData` and `Map` during play (below).
 3. G-buffer cost is a third of the frame. The two most expensive pixel shaders in the frame cost 8.21% and 7.60%. They are probably material shaders of that pass, but this is unverified. They are candidates for checking in the converted Metal code.
 
 ## What done means for the first milestone
 
 The native host draws one replayed battle frame that matches the DXMT capture within a stated image tolerance on an M1 Pro.
 That establishes shader conversion and pass reproduction for one frame. It does not establish a full renderer, asset loading, or frame rate.
+
+## Render-thread wait counters (2026-10-17)
+
+In shader-capture mode, the DLL hooks `ID3D11DeviceContext::GetData`, `Map`, and `Flush`. Every 120 frames it writes one `waits:` line to the sc6vrr log with per-frame averages:
+
+- **Query waits:** the time from a query's first "not ready" result to its ready result on the same query. Present ends any open wait, so one wait never spans two frames.
+- **`GetData` calls** and how many returned "not ready".
+- **`Map` time:** the time spent inside each `Map` call, and the longest one.
+- **`Flush` calls.**
+
+The F10 frame log also gets `QueryWait`, `Map`, and `Flush` lines. Each wait costs the encoding thread time that it cannot spend on the next frame. If query waits are large, a DXMT change can return occlusion results sooner, or report them as visible without waiting.
+
+### First run (2026-10-17 10:27, menus and one battle, MetalFX off)
+
+Log: `sc6vrr-20261017-102705.log`, 74 `waits:` lines of 120 frames each. During the battle (lines 19 to 73):
+
+| Measure | Typical per frame | Highest 120-frame average |
+| --- | --- | --- |
+| Query waits | 0.5 to 2 ms, about 1 wait | 12.3 ms (43,053 `GetData` calls) |
+| Longest single query wait | 3 to 8 ms | 117.9 ms (a load or scene change, inferred) |
+| `Map` | 0.5 to 0.6 ms in about 1,100 to 1,300 calls; longest usually under 0.3 ms | 3.7 ms, with one 167 ms call |
+| `Flush` | about the same count as "not ready" results | |
+
+What this shows:
+
+1. About once per frame, the render thread polls one query until it is ready. Each millisecond of waiting is about 3,500 `GetData` calls, so the game spins on the CPU rather than sleeping.
+2. The `Flush` count matches the "not ready" count. Inferred: DXMT's `GetData` calls `Flush` through the vtable on every "not ready" result (`d3d11_context_imm.cpp`), so the hook counts DXMT's flushes, not the game's. After the first one, these flushes have no new commands to send.
+3. The query is an event query (confirmed in the second run below). Inferred: it is UE4's per-frame GPU sync, which stops the CPU from getting too far ahead of the GPU. A long wait therefore means the GPU is behind. It is not wasted DXMT work, and making `GetData` return sooner would not raise the frame rate.
+4. `Map` costs about 0.5 ms of CPU per frame. Almost none of that is waiting for the GPU.
+
+Conclusion: the render thread's waits measure GPU time, so the GPU work in the profile above is the target, led by the G-buffer pass. A DXMT change to poll more cheaply would save CPU power, but not frame time.
+
+### Second run: query kinds (2026-10-17 10:32, menus and one battle)
+
+Log: `sc6vrr-20261017-103259.log`, 69 `waits:` lines. Each wait now records the query kind from `GetDesc`.
+
+| Kind | Average wait per frame | Share of query wait time |
+| --- | --- | --- |
+| Event | 0.700 ms | 98.3% |
+| Occlusion | 0.011 ms | 1.5% |
+| Timestamp disjoint | 0.001 ms | 0.2% |
+
+This confirms point 3 of the first run. The render thread waits on an event query, which is UE4's way to wait until the GPU finishes earlier work. Occlusion results are almost always ready when the game asks. So no DXMT change to queries would raise the frame rate. The GPU work is the target.

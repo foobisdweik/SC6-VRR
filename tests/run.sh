@@ -149,6 +149,9 @@ env_list=(
   DXMT_LOG_LEVEL=trace "DXMT_LOG_PATH=$dxmt_log_win"
   "SC6VRR_LOG=Z:${run_dir//\//\\}\\sc6vrr.log"
   MTL_HUD_ENABLED=1 MTL_HUD_LOG_ENABLED=1
+  # MetalFX upscaling cost about 4 ms per frame in the 2026-10-17 profile.
+  # DXMT turns it on only when this is "1", so "0" overrides a shell export.
+  DXMT_METALFX_SPATIAL_SWAPCHAIN=0
   $TEST_ENV
 )
 env_arg=""

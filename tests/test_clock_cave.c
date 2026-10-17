@@ -25,6 +25,82 @@ static void fake_world(void *world, int tick_type, float delta) {
   assert(delta == 0.125f);
 }
 
+static unsigned fixed_world_calls;
+static void fake_fixed_world(void *world, int tick_type, float delta) {
+  assert(world == (void *)0x12345678 || world == (void *)0x87654321);
+  assert(tick_type == 2);
+  assert(delta == SC6_LOGIC_DELTA);
+  fixed_world_calls++;
+}
+
+static void test_fixed_world(void) {
+  SetEnvironmentVariableA("SC6VRR_UNCAP", "1");
+  SetEnvironmentVariableA("SC6VRR_GATE", "0");
+  SetEnvironmentVariableA("SC6VRR_MAX_FPS", NULL);
+  read_frame_config();
+  assert(cfg_uncap && cfg_gate && cfg_max_fps == 0.0f);
+  SetEnvironmentVariableA("SC6VRR_MAX_FPS", "120");
+  read_frame_config();
+  assert(cfg_gate && cfg_max_fps == 120.0f);
+  SetEnvironmentVariableA("SC6VRR_MAX_FPS", "-1");
+  read_frame_config();
+  assert(cfg_max_fps == 0.0f);
+  cfg_measure = 0;
+  orig_world_tick = fake_fixed_world;
+  sc6_fixed_clock clock = {0};
+  /* Two worlds share each decision. A skipped frame must advance neither. */
+  for (unsigned frame = 0; frame < 2400; frame++) {
+    g_skip_battle = !sc6_fixed_step(&clock, frame * 250, 60000);
+    hook_world_tick((void *)0x12345678, 2, 1.0f / 240);
+    hook_world_tick((void *)0x87654321, 2, 1.0f / 240);
+  }
+  assert(fixed_world_calls == 1200);
+  cfg_gate = 0;
+  g_skip_battle = 1;
+  orig_world_tick = fake_world;
+  hook_world_tick((void *)0x12345678, 3, 0.125f);
+  g_skip_battle = 0;
+  SetEnvironmentVariableA("SC6VRR_UNCAP", NULL);
+  SetEnvironmentVariableA("SC6VRR_GATE", NULL);
+  SetEnvironmentVariableA("SC6VRR_MAX_FPS", NULL);
+  puts("Uncap requires the world gate; two worlds advance at 60 Hz; disabled mode preserves arguments.");
+}
+
+typedef int (*test_value_fn)(void);
+static test_value_fn original_value;
+static int hooked_value(void) { return original_value() + 10; }
+
+static void test_hook_installation(void) {
+  assert(MH_Initialize() == MH_OK);
+  uint8_t *code = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  assert(code);
+  memset(code, 0x90, 4096);
+  const uint8_t value[] = {0xb8, 7, 0, 0, 0, 0xc3}; /* mov eax,7; ret */
+  memcpy(code + 32, value, sizeof(value));
+  test_value_fn function = (test_value_fn)(code + 32);
+  FlushInstructionCache(GetCurrentProcess(), code, 4096);
+  engine_hook_site sites[] = {
+    {code + 32, "b807000000c3", hooked_value, (void **)&original_value},
+    {code + 32, "b807000000c3", hooked_value, (void **)&original_value},
+  };
+  /* A mismatch fails before any code changes. */
+  sites[1].bytes = "cc";
+  assert(!install_required_hooks(sites, 2));
+  assert(function() == 7 && memcmp(code + 32, value, sizeof(value)) == 0);
+  /* Creating the same hook twice fails after the first creation. It must undo it. */
+  sites[1].bytes = sites[0].bytes;
+  assert(!install_required_hooks(sites, 2));
+  assert(function() == 7 && MH_RemoveHook(code + 32) == MH_ERROR_NOT_CREATED);
+  assert(install_required_hooks(sites, 1));
+  assert(function() == 17);
+  assert(MH_DisableHook(code + 32) == MH_OK);
+  assert(MH_RemoveHook(code + 32) == MH_OK);
+  assert(function() == 7 && memcmp(code + 32, value, sizeof(value)) == 0);
+  VirtualFree(code, 0, MEM_RELEASE);
+  assert(MH_Uninitialize() == MH_OK);
+  puts("Hook activation works; byte mismatches and partial creation failures preserve the original code.");
+}
+
 static unsigned fake_fence_depth;
 static void fake_fence(void *self, uint8_t option) {
   assert(self == (void *)0x12345678 && option == 0xA5);
@@ -91,6 +167,8 @@ static void test_thread_names(void) {
 }
 
 int main(void) {
+  test_hook_installation();
+  test_fixed_world();
   test_thread_names();
   uint8_t object[0x3A8] = {0};
   uint32_t *clock = (uint32_t *)(object + 0x3A4);

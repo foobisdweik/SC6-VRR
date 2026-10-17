@@ -9,25 +9,23 @@
  *    UEngine::bUseFixedFrameRate (bit 0x40 at +0x648; DefaultEngine.ini sets it,
  *    which caps the game at 60 fps and forces a 1/60 s engine delta) and returns
  *    SC6VRR_MAX_FPS as the frame limit.
- *  - UEngine::UpdateTimeAndHandleMaxTickRate (0x142189040): runs once at the
- *    start of every engine frame on the game thread. With SC6VRR_GATE=1 it adds
- *    the real elapsed time to an accumulator and decides whether this frame runs
- *    one 60 Hz battle step ("step frame") or none.
- *  - The battle gates from the SC6 modding docs (replay-system.md, HorseMod gate
- *    stack): on frames without a step, the simulation core, six actor ticks and
- *    the time-dilation scalar return at once, and the two master-clock
- *    increments are skipped. The battle therefore advances 60 times per second
- *    while the engine renders faster.
+ *  - UEngine::UpdateTimeAndHandleMaxTickRate (0x142189040): chooses whether
+ *    the current engine frame releases one 60 Hz world update.
+ *  - UWorld::Tick (0x141f02230): skips frames without a released update.
+ *    Every released update receives 1/60 second. Battle actors, input logs,
+ *    round timers, and world time therefore share the native logic rate.
+ *    The engine still draws every frame. Below 60 fps, logic slows as in stock.
  *
  * Settings come from environment variables (set them with `wine --env`):
- *   SC6VRR_UNCAP=1, SC6VRR_MAX_FPS=120, SC6VRR_GATE=1, SC6VRR_LOG=<Windows path>
+ *   SC6VRR_UNCAP=1, SC6VRR_MAX_FPS=0, SC6VRR_LOG=<Windows path>
  *   SC6VRR_MEASURE=1 records completed battle work and elapsed function times.
  *   SC6VRR_SHADER_DIR=<Windows path> records every shader the game creates,
  *   its input layouts, and the shader combinations that its draws use. With
  *   it, F10 in the game also logs one frame's calls to <dir>\frames\.
  *   SC6VRR_SKIP_GS_DRAWS=1 drops geometry-shader draws, for GPU profiling only.
  *   SC6VRR_FRAME_MODS=1 is required for every engine hook above (uncap, gate,
- *   measure). Without it, the DLL changes no frame timing.
+ *   measure). Without it, the DLL changes no frame timing. Uncap always enables
+ *   the 60 Hz world gate. MAX_FPS=0 removes the engine limit.
  */
 #include <windows.h>
 #include <bcrypt.h>
@@ -38,17 +36,29 @@
 #include <stdarg.h>
 #include "MinHook.h"
 #include "measurements.h"
+#include "fixed_step.h"
 
 /* ---------- configuration and logging ---------------------------------- */
 
 static int cfg_uncap, cfg_gate, cfg_measure, cfg_frame_timers, cfg_thread_names;
-static float cfg_max_fps = 120.0f;
+static float cfg_max_fps;
 static FILE *log_file;
 
 static int env_int(const char *name, int fallback) {
   char buf[32];
   DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
   return (n && n < sizeof(buf)) ? atoi(buf) : fallback;
+}
+
+static void read_frame_config(void) {
+  cfg_uncap = env_int("SC6VRR_UNCAP", 0);
+  cfg_gate = cfg_uncap || env_int("SC6VRR_GATE", 0);
+  cfg_measure = env_int("SC6VRR_MEASURE", 0);
+  cfg_frame_timers = env_int("SC6VRR_FRAME_TIMERS", 0);
+  cfg_thread_names = env_int("SC6VRR_THREAD_NAMES", 0);
+  cfg_max_fps = (float)env_int("SC6VRR_MAX_FPS", 0);
+  if (cfg_max_fps < 0.0f)
+    cfg_max_fps = 0.0f;
 }
 
 static void log_msg(const char *fmt, ...) {
@@ -165,25 +175,6 @@ static int exe_hash_matches(void) {
 #define IMAGE_BASE 0x140000000ull
 #define ADDR(a) ((void *)((uintptr_t)(a) - IMAGE_BASE + (uintptr_t)GetModuleHandleW(NULL)))
 
-typedef struct {
-  const char *name;
-  uint64_t addr;
-  const char *prologue_hex; /* first bytes, checked before hooking */
-  int returns_float;        /* gate stub returns 0.0f in xmm0 */
-} gate_site;
-
-/* Battle gates (SC6 docs: replay-system.md "Site 9 plus seven Actor::Tick gates"). */
-static const gate_site kGates[] = {
-  {"Site9 LuxBattle_PerFrameTick",          0x1402DBC60, "4c8bdc49895b1049896b1856", 0},
-  {"Site11 Chara_AdvanceReplayFrame",       0x1403F8410, "40534883ec3083b900440000", 0},
-  {"Site20 FrameInputLog_TickActor",        0x1403FBDF0, "40534883ec20488bd9e82265", 0},
-  {"Site21 BM_MainStateMachine",            0x1403FBF30, "40534883ec30488bd90f2974", 0},
-  {"Site21b BM_Update_Impl",                0x140437590, "488bc4554156488d68a14881", 0},
-  {"Site22 Chara_TickActor",                0x1403D0590, "4055535641544155488dac24", 0},
-  {"Site22b DemoHuman_TickActor",           0x1404865B0, "488bc45556488d68a14881ec", 0},
-  {"MoveVM_GetTimeDilationScalar",          0x14030A8C0, "0fb6913c0200004c8d0d02ba", 1},
-};
-
 /* Master-clock increments: `inc dword [rbx+0x3A4]` (FF 83 A4 03 00 00). */
 static const uint64_t kClockIncs[] = {0x1403E1FEA /* R1+0x2A */, 0x1403E2033 /* R2+0x33 */};
 
@@ -224,8 +215,8 @@ static uint8_t *alloc_near(void *target, size_t size) {
 
 /* ---------- gating ------------------------------------------------------- */
 
-/* 1 = this engine frame has no battle step: gated paths return at once.
- * Read by generated machine code, so it is a plain byte. */
+/* 1 = this engine frame has no world update. The clock counters read this
+ * byte too, although skipped worlds cannot reach their clock instructions. */
 static volatile uint8_t g_skip_battle = 0;
 static volatile uint64_t g_clock_advances[2];
 
@@ -247,22 +238,6 @@ static double qpc_seconds(void) {
     QueryPerformanceFrequency(&freq);
   QueryPerformanceCounter(&now);
   return (double)now.QuadPart / (double)freq.QuadPart;
-}
-
-/* Entry stub: mov rax,&g_skip_battle; cmp byte [rax],0; jne skip;
- * mov rax,<trampoline>; jmp rax; skip: [xorps xmm0,xmm0;] ret.
- * Only rax (volatile, never an argument register) is touched, so the stub
- * works for any signature. */
-static uint8_t *make_gate_stub(uint8_t *mem, int returns_float, void ***tramp_slot) {
-  uint8_t *p = mem;
-  *p++ = 0x48; *p++ = 0xB8; *(uint64_t *)p = (uint64_t)(uintptr_t)&g_skip_battle; p += 8;
-  *p++ = 0x80; *p++ = 0x38; *p++ = 0x00;
-  *p++ = 0x75; *p++ = 0x0C;
-  *p++ = 0x48; *p++ = 0xB8; *tramp_slot = (void **)p; *(uint64_t *)p = 0; p += 8;
-  *p++ = 0xFF; *p++ = 0xE0;
-  if (returns_float) { *p++ = 0x0F; *p++ = 0x57; *p++ = 0xC0; }
-  *p++ = 0xC3;
-  return p;
 }
 
 /* The clock cave runs in place of the original INC. Restore incoming flags
@@ -296,39 +271,37 @@ static uint8_t *make_clock_cave(uint8_t *mem, unsigned clock_index) {
   return p;
 }
 
-static int install_gates(void) {
+static uint8_t *clock_caves;
+
+static void remove_clock_counters(void) {
+  if (!clock_caves)
+    return;
+  const uint8_t original[] = {0xff, 0x83, 0xa4, 0x03, 0x00, 0x00};
+  for (unsigned i = 0; i < 2; i++) {
+    DWORD old;
+    void *site = ADDR(kClockIncs[i]);
+    if (VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) {
+      memcpy(site, original, sizeof(original));
+      FlushInstructionCache(GetCurrentProcess(), site, 6);
+      VirtualProtect(site, 6, old, &old);
+    }
+  }
+  /* Keep the caves allocated if a page could not be restored. */
+}
+
+static int install_clock_counters(void) {
   uint8_t *mem = alloc_near(ADDR(0x1402DBC60), 0x1000);
   if (!mem) {
     log_msg("gates: no executable memory near the exe");
     return 0;
   }
   uint8_t *p = mem;
-  size_t gate_count = cfg_gate ? sizeof(kGates) / sizeof(kGates[0]) : 0;
-  for (size_t i = 0; i < gate_count; i++) {
-    void *target = ADDR(kGates[i].addr);
-    if (!bytes_match(target, kGates[i].prologue_hex)) {
-      log_msg("gates: prologue mismatch at %s; not hooking anything", kGates[i].name);
-      return 0;
-    }
-  }
   for (size_t i = 0; i < sizeof(kClockIncs) / sizeof(kClockIncs[0]); i++) {
     if (!bytes_match(ADDR(kClockIncs[i]), "ff83a4030000")) {
       log_msg("gates: clock INC mismatch at 0x%llx; not hooking anything", (unsigned long long)kClockIncs[i]);
+      VirtualFree(mem, 0, MEM_RELEASE);
       return 0;
     }
-  }
-  for (size_t i = 0; i < gate_count; i++) {
-    void **tramp_slot;
-    uint8_t *stub = p;
-    p = make_gate_stub(p, kGates[i].returns_float, &tramp_slot);
-    void *trampoline = NULL;
-    MH_STATUS st = MH_CreateHook(ADDR(kGates[i].addr), stub, &trampoline);
-    if (st != MH_OK) {
-      log_msg("gates: MH_CreateHook(%s) failed: %d", kGates[i].name, st);
-      return 0;
-    }
-    *tramp_slot = trampoline;
-    log_msg("gate: %s", kGates[i].name);
   }
   for (size_t i = 0; i < sizeof(kClockIncs) / sizeof(kClockIncs[0]); i++) {
     uint8_t *cave = p;
@@ -337,10 +310,16 @@ static int install_gates(void) {
     int64_t rel = (int64_t)(cave - (site + 5));
     if (rel != (int32_t)rel) {
       log_msg("gates: cave out of rel32 range");
+      remove_clock_counters();
       return 0;
     }
     DWORD old;
-    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old);
+    if (!VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &old)) {
+      log_msg("measurement: cannot write clock counter");
+      remove_clock_counters();
+      return 0;
+    }
+    clock_caves = mem;
     site[0] = 0xE8;
     *(int32_t *)(site + 1) = (int32_t)rel;
     site[5] = 0x90;
@@ -504,6 +483,11 @@ static int install_frame_timers(void) {
 }
 
 static void hook_world_tick(void *world, int tick_type, float delta) {
+  if (cfg_gate) {
+    if (g_skip_battle)
+      return;
+    delta = SC6_LOGIC_DELTA;
+  }
   if (!cfg_measure || GetCurrentThreadId() != measurements.engine_thread) {
     orig_world_tick(world, tick_type, delta);
     return;
@@ -586,37 +570,101 @@ static void hook_update_time(void *self) {
   double timing_start = cfg_measure ? qpc_seconds() : 0.0;
   orig_update_time(self);
 
-  static double last, acc, window_start;
+  static sc6_fixed_clock clock;
+  static double window_start;
   static unsigned frames, steps;
-  const double step = 1.0 / 60.0;
-  double now = qpc_seconds();
+  LARGE_INTEGER counter, frequency;
+  QueryPerformanceCounter(&counter);
+  QueryPerformanceFrequency(&frequency);
+  double now = (double)counter.QuadPart / (double)frequency.QuadPart;
   if (cfg_measure)
     measure_frame(now, timing_start);
-  if (last == 0.0) {
-    last = now;
+  if (!window_start)
     window_start = now;
-  }
-  double dt = now - last;
-  last = now;
-
-  if (cfg_gate) {
-    acc += dt;
-    if (acc > 0.1) /* after a long hitch, do not try to catch up */
-      acc = 0.1;
-    if (acc >= step) {
-      acc -= step;
-      g_skip_battle = 0;
-      steps++;
-    } else {
-      g_skip_battle = 1;
-    }
-  }
+  g_skip_battle = cfg_gate && !sc6_fixed_step(&clock, (uint64_t)counter.QuadPart,
+                                            (uint64_t)frequency.QuadPart);
+  if (!g_skip_battle)
+    steps++;
   frames++;
   if (now - window_start >= 1.0) {
-    log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, cfg_gate ? steps : frames, now - window_start);
+    log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, steps, now - window_start);
     frames = steps = 0;
     window_start = now;
   }
+}
+
+/* Prepare every required hook before enabling the unlock. The unlock cannot
+ * run if creation or activation of the world gate fails. Shader hooks remain
+ * independent because capture-only launches use them without engine hooks. */
+typedef struct {
+  void *target;
+  const char *bytes;
+  void *hook;
+  void **original;
+} engine_hook_site;
+
+static int install_required_hooks(const engine_hook_site *sites, unsigned count) {
+  unsigned created = 0;
+  for (unsigned i = 0; i < count; i++) {
+    if (!bytes_match(sites[i].target, sites[i].bytes)) {
+      log_msg("sc6vrr: engine prologue mismatch at %p", sites[i].target);
+      return 0;
+    }
+  }
+  for (; created < count; created++) {
+    MH_STATUS status = MH_CreateHook(sites[created].target, sites[created].hook, sites[created].original);
+    if (status != MH_OK) {
+      log_msg("sc6vrr: engine hook creation failed (%d)", status);
+      goto failed;
+    }
+  }
+  /* The caller puts the cap hook last, after the schedule and world gate. */
+  for (unsigned i = 0; i < count; i++) {
+    MH_STATUS status = MH_EnableHook(sites[i].target);
+    if (status != MH_OK) {
+      log_msg("sc6vrr: engine hook activation failed (%d)", status);
+      goto failed;
+    }
+  }
+  return 1;
+
+failed:
+  while (created) {
+    void *target = sites[--created].target;
+    MH_DisableHook(target);
+    MH_RemoveHook(target);
+  }
+  g_skip_battle = 0;
+  return 0;
+}
+
+static int install_engine_hooks(void) {
+  engine_hook_site sites[] = {
+    {ADDR(ADDR_WORLD_TICK), "488bc455535657415441554156415748", hook_world_tick, (void **)&orig_world_tick},
+    {ADDR(ADDR_UPDATE_TIME), "40555357488d6c24b94881ec", hook_update_time, (void **)&orig_update_time},
+    {ADDR(ADDR_GET_MAX_TICK_RATE), "40534883ec500f2974244048", hook_get_max_tick_rate, (void **)&orig_get_max_tick_rate},
+  };
+  if (!install_required_hooks(sites, sizeof(sites) / sizeof(sites[0])))
+    return 0;
+  if (cfg_measure &&
+      (!bytes_match(ADDR(ADDR_BATTLE_COUNTER_INC), "ff05720d4304") || !install_clock_counters())) {
+    cfg_measure = 0;
+    log_msg("measurement: disabled; 60 Hz world gate remains active");
+  }
+  if (cfg_frame_timers && (!cfg_measure || !install_frame_timers()))
+    cfg_frame_timers = 0;
+  if (cfg_frame_timers) {
+    const uint64_t timers[] = {ADDR_FRAME_LOOP, ADDR_GAME_TICK, ADDR_FRAME_SYNC, ADDR_FENCE_WAIT};
+    for (unsigned i = 0; i < 4; i++) {
+      if (MH_EnableHook(ADDR(timers[i])) != MH_OK) {
+        cfg_frame_timers = 0;
+        log_msg("frame timers: activation failed; timing remains active");
+      }
+    }
+  }
+  log_msg("sc6vrr: engine hooks enabled; world_gate=%d logic_hz=60 max_fps=%.0f", cfg_gate, cfg_max_fps);
+  return 1;
+
 }
 
 /* ---------- shader capture ----------------------------------------------- */
@@ -1401,7 +1449,7 @@ enum {
   CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_CS_SET, CTX_PS_SRV, CTX_CS_SRV,
   CTX_CS_UAV, CTX_CLEAR_RTV, CTX_CLEAR_DSV, CTX_VIEWPORTS, CTX_DISPATCH, CTX_DISPATCH_INDIRECT, CTX_COPY_RESOURCE,
   CTX_COPY_REGION, CTX_RESOLVE, CTX_DEPTH_STATE, CTX_RASTER_STATE, CTX_VS_SRV, CTX_PS_SAMPLERS, CTX_VS_SAMPLERS,
-  CTX_CS_SAMPLERS, CTX_COUNT
+  CTX_CS_SAMPLERS, CTX_GET_DATA, CTX_MAP, CTX_FLUSH, CTX_COUNT
 };
 static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(VSSetShader), CONTEXT_SLOT(GSSetShader), CONTEXT_SLOT(PSSetShader),
@@ -1415,7 +1463,8 @@ static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(Dispatch), CONTEXT_SLOT(DispatchIndirect), CONTEXT_SLOT(CopyResource),
     CONTEXT_SLOT(CopySubresourceRegion), CONTEXT_SLOT(ResolveSubresource), CONTEXT_SLOT(OMSetDepthStencilState),
     CONTEXT_SLOT(RSSetState), CONTEXT_SLOT(VSSetShaderResources), CONTEXT_SLOT(PSSetSamplers),
-    CONTEXT_SLOT(VSSetSamplers), CONTEXT_SLOT(CSSetSamplers)};
+    CONTEXT_SLOT(VSSetSamplers), CONTEXT_SLOT(CSSetSamplers), CONTEXT_SLOT(GetData), CONTEXT_SLOT(Map),
+    CONTEXT_SLOT(Flush)};
 static const char *const kContextNames[CTX_COUNT] = {
     "VSSetShader", "GSSetShader", "PSSetShader", "IASetInputLayout", "IASetPrimitiveTopology",
     "IASetVertexBuffers", "OMSetRenderTargets", "OMSetRenderTargetsAndUnorderedAccessViews", "OMSetBlendState",
@@ -1423,7 +1472,8 @@ static const char *const kContextNames[CTX_COUNT] = {
     "DrawInstancedIndirect", "CSSetShader", "PSSetShaderResources", "CSSetShaderResources",
     "CSSetUnorderedAccessViews", "ClearRenderTargetView", "ClearDepthStencilView", "RSSetViewports", "Dispatch",
     "DispatchIndirect", "CopyResource", "CopySubresourceRegion", "ResolveSubresource", "OMSetDepthStencilState",
-    "RSSetState", "VSSetShaderResources", "PSSetSamplers", "VSSetSamplers", "CSSetSamplers"};
+    "RSSetState", "VSSetShaderResources", "PSSetSamplers", "VSSetSamplers", "CSSetSamplers", "GetData", "Map",
+    "Flush"};
 static void *orig_context[CTX_COUNT];
 
 /* Reads the formats of the bound views. A view's format can differ from its
@@ -1758,6 +1808,111 @@ static void WINAPI hook_cs_samplers_set(void *ctx, UINT start, UINT count, void 
   ((set_samplers_fn)orig_context[CTX_CS_SAMPLERS])(ctx, start, count, samplers);
 }
 
+/* Waits on the game's render thread. UE4 reads occlusion query results with a
+ * loop that calls GetData until it returns S_OK, and DXMT blocks inside Map
+ * until the GPU is done with a staging resource. Either one stops the thread
+ * that encodes the next frame. A query wait runs from the first S_FALSE to the
+ * S_OK on the same query, and Present ends any open wait, so one counted wait
+ * never spans two frames. */
+typedef HRESULT(WINAPI *get_data_fn)(void *ctx, void *async, void *data, UINT size, UINT flags);
+typedef HRESULT(WINAPI *map_fn)(void *ctx, void *resource, UINT sub, D3D11_MAP type, UINT flags,
+                                D3D11_MAPPED_SUBRESOURCE *out);
+typedef void(WINAPI *flush_fn)(void *ctx);
+/* D3D11_QUERY kinds 0 to 15. ID3D11Predicate and ID3D11Counter keep GetDesc in
+ * the same vtable slot, with a two-UINT description whose first field is the
+ * kind, so the same call reads them. Other values (counter IDs) count as
+ * QUERY_OTHER. */
+_Static_assert(offsetof(ID3D11QueryVtbl, GetDesc) / sizeof(void *) == 8, "unexpected ID3D11Query layout");
+typedef void(WINAPI *query_desc_fn)(void *query, D3D11_QUERY_DESC *desc);
+enum { QUERY_KINDS = 16, QUERY_OTHER = QUERY_KINDS };
+static const char *const kQueryKindNames[QUERY_KINDS + 1] = {
+    "event", "occlusion", "timestamp", "timestamp-disjoint", "pipeline-statistics", "occlusion-predicate",
+    "so-statistics", "so-overflow-predicate", "so-statistics-0", "so-overflow-0", "so-statistics-1",
+    "so-overflow-1", "so-statistics-2", "so-overflow-2", "so-statistics-3", "so-overflow-3", "other"};
+static struct {
+  uint64_t frames, polls, not_ready, query_waits, maps, flushes;
+  double query_ms, query_max_ms, map_ms, map_max_ms;
+  uint64_t kind_waits[QUERY_KINDS + 1];
+  double kind_ms[QUERY_KINDS + 1];
+} waits;
+
+static unsigned query_kind(void *query) {
+  D3D11_QUERY_DESC desc = {0};
+  ((query_desc_fn)(*(void ***)query)[offsetof(ID3D11QueryVtbl, GetDesc) / sizeof(void *)])(query, &desc);
+  return (unsigned)desc.Query < QUERY_KINDS ? (unsigned)desc.Query : QUERY_OTHER;
+}
+static void *waiting_query;
+static double waiting_since;
+static unsigned waiting_polls;
+#define WAIT_REPORT_FRAMES 120
+
+static HRESULT WINAPI hook_get_data(void *ctx, void *async, void *data, UINT size, UINT flags) {
+  double t0 = qpc_seconds();
+  HRESULT hr = ((get_data_fn)orig_context[CTX_GET_DATA])(ctx, async, data, size, flags);
+  waits.polls++;
+  if (hr == S_FALSE) {
+    waits.not_ready++;
+    if (async != waiting_query)
+      waiting_query = async, waiting_since = t0, waiting_polls = 0;
+    waiting_polls++;
+  } else if (async == waiting_query) {
+    double ms = (qpc_seconds() - waiting_since) * 1000.0;
+    waits.query_waits++;
+    waits.query_ms += ms;
+    if (ms > waits.query_max_ms) waits.query_max_ms = ms;
+    unsigned kind = query_kind(async);
+    waits.kind_waits[kind]++;
+    waits.kind_ms[kind] += ms;
+    if (FRAME_LOGGING_NOW)
+      frame_line("QueryWait\tkind=%s\tms=%.3f\tpolls=%u\tflags=0x%x\tsize=%u", kQueryKindNames[kind], ms,
+                 waiting_polls + 1, flags, size);
+    waiting_query = NULL;
+  }
+  return hr;
+}
+static HRESULT WINAPI hook_map(void *ctx, void *resource, UINT sub, D3D11_MAP type, UINT flags,
+                               D3D11_MAPPED_SUBRESOURCE *out) {
+  double t0 = qpc_seconds();
+  HRESULT hr = ((map_fn)orig_context[CTX_MAP])(ctx, resource, sub, type, flags, out);
+  double ms = (qpc_seconds() - t0) * 1000.0;
+  waits.maps++;
+  waits.map_ms += ms;
+  if (ms > waits.map_max_ms) waits.map_max_ms = ms;
+  if (FRAME_LOGGING_NOW) {
+    char r[160];
+    describe_resource(resource, r, sizeof(r));
+    frame_line("Map\tresource=%s\tsub=%u\ttype=%u\tflags=0x%x\tms=%.3f\thr=0x%08lx", r, sub, (unsigned)type, flags,
+               ms, (unsigned long)hr);
+  }
+  return hr;
+}
+static void WINAPI hook_flush(void *ctx) {
+  waits.flushes++;
+  if (FRAME_LOGGING_NOW)
+    frame_line("Flush");
+  ((flush_fn)orig_context[CTX_FLUSH])(ctx);
+}
+
+/* Called at every Present: ends an open query wait and logs averages. */
+static void waits_present(void) {
+  waiting_query = NULL;
+  if (++waits.frames < WAIT_REPORT_FRAMES)
+    return;
+  double n = (double)waits.frames;
+  char kinds[512] = "";
+  size_t used = 0;
+  for (int k = 0; k <= QUERY_KINDS && used < sizeof(kinds); k++)
+    if (waits.kind_waits[k])
+      used += (size_t)snprintf(kinds + used, sizeof(kinds) - used, "%s%s %.2f waits %.3f ms", used ? ", " : "",
+                               kQueryKindNames[k], waits.kind_waits[k] / n, waits.kind_ms[k] / n);
+  log_msg("waits: per frame over %llu frames: query waits %.3f ms (%.2f waits, longest %.3f ms; by kind: %s), "
+          "GetData %.1f calls (%.1f not ready), Map %.3f ms (%.1f calls, longest %.3f ms), Flush %.2f calls",
+          (unsigned long long)waits.frames, waits.query_ms / n, waits.query_waits / n, waits.query_max_ms,
+          used ? kinds : "none", waits.polls / n, waits.not_ready / n, waits.map_ms / n, waits.maps / n,
+          waits.map_max_ms, waits.flushes / n);
+  memset(&waits, 0, sizeof(waits));
+}
+
 /* Replaces vtable pointers instead of patching the methods' code. Under
  * CrossOver Preview with FEX, d3d11.dll is ARM64EC: its methods are native
  * ARM64 code, so an x64 jump written over them is an illegal instruction
@@ -1803,6 +1958,7 @@ static volatile LONG factory_hooked, present_hooked;
 
 static HRESULT WINAPI hook_present(void *swapchain, UINT sync_interval, UINT flags) {
   frame_present();
+  waits_present();
   return orig_present(swapchain, sync_interval, flags);
 }
 
@@ -1923,7 +2079,7 @@ static void install_device_shader_hooks(void *device) {
       hook_clear_rtv,   hook_clear_dsv,      hook_viewports_set, hook_dispatch,
       hook_dispatch_indirect, hook_copy_resource, hook_copy_region, hook_resolve,
       hook_depth_state_set, hook_raster_state_set, hook_vs_srv_set, hook_ps_samplers_set,
-      hook_vs_samplers_set, hook_cs_samplers_set};
+      hook_vs_samplers_set, hook_cs_samplers_set, hook_get_data, hook_map, hook_flush};
   swap_vtable_slots(context_vtable, kContextSlots, context_hooks, orig_context, CTX_COUNT, kContextNames);
   ((release_fn)context_vtable[2])(context);
 }
@@ -1980,12 +2136,7 @@ static int install_shader_capture(void *create_device, void *create_device_swapc
 
 static void setup(void) {
   open_log();
-  cfg_uncap = env_int("SC6VRR_UNCAP", 0);
-  cfg_gate = env_int("SC6VRR_GATE", 0);
-  cfg_measure = env_int("SC6VRR_MEASURE", 0);
-  cfg_frame_timers = env_int("SC6VRR_FRAME_TIMERS", 0);
-  cfg_thread_names = env_int("SC6VRR_THREAD_NAMES", 0);
-  cfg_max_fps = (float)env_int("SC6VRR_MAX_FPS", 120);
+  read_frame_config();
   log_msg("sc6vrr: uncap=%d gate=%d max_fps=%.0f measure=%d", cfg_uncap, cfg_gate, cfg_max_fps, cfg_measure);
 
   if (!exe_hash_matches()) {
@@ -2014,43 +2165,13 @@ static void setup(void) {
                                 (void *)GetProcAddress(dxgi, "CreateDXGIFactory1")))
       log_msg("frames: frame log disabled (dxgi %p)", (void *)dxgi);
   }
-  /* Frame-rate changes are switched off for now (2026-10-16). The engine hooks
-   * below go in only with SC6VRR_FRAME_MODS=1, whatever the other settings say. */
+  /* Capture-only launches keep stock timing unless frame changes are requested. */
   if (!env_int("SC6VRR_FRAME_MODS", 0)) {
     log_msg("sc6vrr: frame-rate modifications disabled; set SC6VRR_FRAME_MODS=1 to allow them");
     return;
   }
-  if (!bytes_match(ADDR(ADDR_GET_MAX_TICK_RATE), "40534883ec500f2974244048") ||
-      !bytes_match(ADDR(ADDR_UPDATE_TIME), "40555357488d6c24b94881ec")) {
-    log_msg("sc6vrr: engine function prologue mismatch; no hooks installed");
-    return;
-  }
-  MH_CreateHook(ADDR(ADDR_GET_MAX_TICK_RATE), hook_get_max_tick_rate, (void **)&orig_get_max_tick_rate);
-  MH_CreateHook(ADDR(ADDR_UPDATE_TIME), hook_update_time, (void **)&orig_update_time);
-  if (cfg_measure) {
-    if (!bytes_match(ADDR(ADDR_WORLD_TICK), "488bc455535657415441554156415748") ||
-        !bytes_match(ADDR(ADDR_BATTLE_COUNTER_INC), "ff05720d4304")) {
-      log_msg("measurement: world prologue or completed-counter INC mismatch; measurement disabled");
-      cfg_measure = 0;
-    } else {
-      MH_STATUS st = MH_CreateHook(ADDR(ADDR_WORLD_TICK), hook_world_tick, (void **)&orig_world_tick);
-      if (st != MH_OK) {
-        log_msg("measurement: world hook creation failed (%d); measurement disabled", st);
-        cfg_measure = 0;
-      }
-    }
-  }
-  if ((cfg_gate || cfg_measure) && !install_gates()) {
-    log_msg("sc6vrr: gating and measurement disabled");
-    cfg_gate = 0;
-    cfg_measure = 0;
-  }
-  if (cfg_frame_timers && (!cfg_measure || !install_frame_timers())) {
-    cfg_frame_timers = 0;
-    log_msg("frame timers: disabled; baseline measurement remains available");
-  }
-  MH_STATUS st = MH_EnableHook(MH_ALL_HOOKS);
-  log_msg("sc6vrr: hooks enabled (%d)", st);
+  if (!install_engine_hooks())
+    log_msg("sc6vrr: engine hooks failed; stock frame timing remains active");
 }
 
 /* ---------- dinput8 proxy ------------------------------------------------ */
