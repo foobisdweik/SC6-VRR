@@ -1,8 +1,44 @@
-# SC6-VRR handoff (2026-10-15)
+# SC6-VRR handoff (2026-10-16)
+
+## Active direction
+
+The user deferred Metal rendering, HDR, ProMotion, interpolation, and game timing changes.
+Focus on native ARM64 battle logic while preserving the original behavior and timing.
+The user requested broad tests, rather than more isolated function probes.
+Use connected battle functions and recorded sequences that exercise both fighters.
+See [the native plan](notes/native-port.md) and [the broader test plan](notes/native-battle-tests.md).
+
+The latest proof matches all observed outputs from 64 actual movement calls in `SC6-fex`.
+Eleven calls changed position. No airborne state was captured.
+The temporary recorder was removed after SC6 exited, and the existing backup was preserved.
+Recovered code and captures remain outside Git under `/Users/iphoobis/Library/Application Support/SC6-VRR/native-investigation/`.
+This proof is preliminary and does not satisfy the broader test requirement.
+
+## Earlier VRR investigation
+
+The reports and priorities below describe the earlier work. The active direction above takes precedence.
+
+Thread identification completed: the reproduced full-core thread is SC6's `RenderThread 2`. In case 19, its Windows thread ID `688` mapped through its thread record to OS counter handle `0x7ff2067740e0`, which measured 99.286% CPU. The independent game-thread check mapped Windows ID `340` to `0x7ff2061fa0e0` at 26.749%. DXMT's named encoding thread used 41.222%. This identifies the role, not the expensive function. The proof is in `tests/runs/20261016-152131-19-thread-names/thread-role-proof.json`, and the full account is `notes/thread-identity.md`. The earlier case 18 profiler matched the busy OS thread exactly but produced unreliable Windows stacks. Do not infer precise function costs or a busy-wait mechanism from them.
+
+The installed diagnostic DLL has SHA-256 `3f221a93f84ac6435236b12de4e18c5b013aa81b4e2794e912624a8e230cf31e`. Its optional name observer is enabled only by `SC6VRR_THREAD_NAMES=1`. The prior DLL is backed up at `/Users/iphoobis/Library/Application Support/SC6-VRR/backups/thread-names-dll-20261016-152115/dinput8.dll`. All 27 Python tests, the DLL build, and the Wine tests passed. The exception observer preserves original exception handling. It logs names requested for other threads but does not pass those names to macOS. The final identification therefore uses read-only Windows thread records. Game Mode is off, its policy is automatic, and all game processes and bottle services have exited.
+
+Profiler output handling: an initial preflight exposed a Hugging Face token in tool output through an unfiltered trace index. The user was notified and advised to rotate it. The scratch trace was deleted. Later launches use an environment allowlist, and the live trace was checked to contain zero credential-named environment fields. Never print a raw `xctrace export --toc` result. Export selected data tables or remove the environment section before inspecting the index.
+
+Four-test result on 2026-10-16: all four idle recordings and native exports completed. The user confirmed idle fighters in all four tests and the same composited window in tests 3 and 4. Cases 14–17 measured 80.077, 80.017, 86.180, and 86.611 fps. Each measured about 60 battle advances/s. The DXMT pair differs by 0.0757%, so it shows no clear timer penalty in this idle scene. Test 4 rendered the floor black while the grass appeared normal. Its capture remains valid, but it is excluded from conclusions that require matching, correct rendering. The D3DMetal pair cannot establish timer cost. Cross-implementation comparisons also differ in upscaling, native layer dimensions, pixel format, and presentation. Do not infer an isolated translation advantage from the higher D3DMetal fps. The full report is `notes/idle-comparison.md`. The next investigation should identify the render thread's expensive work and separately check D3DMetal's black floor.
+
+Completed request: run four idle tests on Kaer Morhen with Geralt and Groh. Cases 14 and 15 use DXMT with the four detail timers enabled then disabled. Cases 16 and 17 use D3DMetal with the same timer change. The harness supports an explicit graphics selection and records its DLL hash and mapped files. These four cases preserved shader caches and graphics settings. The fixed final 35-second selections all retain at least 30 seconds of complete measurement windows. Use `tests/summarize_idle.py` to regenerate the summaries. The procedure is in `notes/frame-tests.md`.
+
+Case 13 update on 2026-10-16: `tests/runs/20261016-143928-13-timer-control` completed and exported native Metal data. The user confirmed Kaer Morhen, Geralt, and Groh, but said the actions differed from case 11. Therefore, the pair cannot isolate timer overhead. The 5% threshold does not establish comparability when actions differ. Repeat both cases with the same specified actions before drawing an overhead conclusion. The four detail timers were disabled, and no detail rows were produced. The gameplay selection measured 79.725 fps and 59.993 battle advances/s. Native presentation measured 79.725 fps. The HUD measured 79.8 fps. Game Mode is off and its policy is automatic. See `notes/test-results.md` and the run's `comparison.json`.
+
+Continuation on 2026-10-16: case `11-frame-breakdown` completed in `tests/runs/20261016-143332-11-frame-breakdown`. The user reported Kaer Morhen, Geralt, and Groh. Its recording lasted 90.019465 seconds after five continuous seconds frontmost. The gameplay selection, inferred from continuous battle-counter advances, measured 82.010 engine frames/s and 60.002 battle advances/s. The HUD and native Metal timeline both measured about 82 fps. All four detail hooks enabled. The rendering wait averaged 7.877 ms within a 12.190 ms frame. One unnamed thread used 99.3% CPU. The native export succeeded, but its GPU timing fields need clarification before attributing the limit. Case 13 must still check timer overhead. Game Mode is off and its policy is automatic. See `notes/test-results.md` for boundaries and limitations. An earlier launch stopped before opening the game because the registry command left Wine services running. The harness now closes those services before clearing caches.
 
 This file is for whoever continues the project. It says what works, what is installed on this Mac, what is open, and the research for the next task: testing SoulCalibur VI in CrossOver Preview with FEX and an ARM64EC build of DXMT.
 
 Read with it: `PLAN.md` (the plan and step status), `notes/test-results.md` (every measured run), `notes/frame-cap.md`, `notes/dxmt.md`, `notes/gamemode.md`.
+
+Continuation on 2026-10-15: step 1's measurement changes are implemented and installed. The live test completed at 18:09 PDT. Its foreground Training selection measured 77.1 engine frames/s and 59.52 completed battle advances/s. The battle counter total matched master-clock increments. Most elapsed frame time lies outside `UWorld::Tick`. See `notes/test-results.md` and `notes/measurement.md`. The corrected summaries separate CPU processes and reject invalid HUD counters. Earlier `steps=` logs count scheduler decisions rather than completed battle work.
+
+Prepared at 18:34 PDT: cases `11-frame-breakdown`, `12-gpu-detail`, and `13-timer-control`. The extended DLL is installed with a backup. Its isolated tests and preflight pass. `notes/frame-tests.md` contains the protocol. `tests/record_window.py arm` waits for five continuous seconds with the game frontmost, then records for 90 seconds. Menu navigation and loading can occur within that interval. Gameplay must be selected separately during analysis. New thread counters and native Metal export are wired into the harness. The user asked to stand by before starting logging. No case 11–13 game run or Metal collection has started.
 
 ## 1. Goal and current result
 
@@ -59,7 +95,7 @@ Known limits:
 
 ## 5. Open work (by priority)
 
-1. **Find the CPU bottleneck without distortion.** Add low-overhead timers in the DLL (for example around `UWorld::Tick` at `0x141F02230` and the frame start) and run with `DXMT_LOG_FRAME_STATS=1` but without `sample`.
+1. **Find the CPU bottleneck without distortion.** The DLL now times `UWorld::Tick` and the engine's timing function. Test 10 verified these measurements in Training without `sample`. The world calls average 1.885 ms summed per engine frame, compared with a 12.970 ms frame interval. The next measurement should cover other engine work, rendering, and waits. This run does not distinguish a CPU limit from a GPU limit. See `notes/measurement.md` and `notes/test-results.md`.
 2. **Test CrossOver Preview with FEX** (section 6). DXMT's encode thread would then run as native ARM64 code instead of translated x86 code.
 3. **Install and test the PSO archive** (`dxmt-SC6` merge `1029cba`). Run the game twice; the second run should log `PipelineArchive` hits and early compiles. Copy all four files together (`d3d11.dll`, `dxgi.dll`, `winemetal.dll`, `winemetal.so`), because the build adds unix calls 147 and 148.
 4. **Interpolation** (plan step 7): blend character render position (`chara+0x2090`), animation frame (`lane+0x08`), and the camera POV (`APlayerCameraManager+0x410..+0x428`) between 60 Hz steps. Research has started; see `SC6-docs/docs/sc6/structures.md` (camera POV section) and `movement.md`.

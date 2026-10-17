@@ -1,4 +1,6 @@
 .DS_Store
+# Downloaded local analysis tool
+/kismet-analyzer-e8982e9-osx-x64/
 # Finder alias to the local game install (machine-specific)
 SoulCalibur_6_symlink
 # Game binaries and dumps never go in this repo
@@ -21,3 +23,7 @@ dll/build/
 
 # Python bytecode
 __pycache__/
+
+# Local Ghidra project files (machine-specific)
+/SC6-Apple.gpr
+/SC6-Apple.lock*

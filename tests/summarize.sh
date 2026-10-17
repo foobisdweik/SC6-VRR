@@ -2,6 +2,7 @@
 # Summarize one test run directory written by tests/run.sh.
 # Usage: tests/summarize.sh <run-dir>
 run_dir=${1:?run dir}
+here=${0:A:h}
 cd $run_dir || exit 1
 
 section() { print; print "== $1" }
@@ -29,9 +30,8 @@ fi
 
 section "sc6vrr DLL (sc6vrr.log)"
 if [[ -f sc6vrr.log ]]; then
-  grep -v "frames=" sc6vrr.log | head -20
-  awk '/frames=/ { for (i=1;i<=NF;i++) { if ($i ~ /^frames=/) { split($i,a,"="); f+=a[2] } if ($i ~ /^steps=/) { split($i,b,"="); s+=b[2] } } n++ }
-       END { if (n) printf "per-second windows: %d, avg engine frames/s: %.1f, avg battle steps/s: %.1f\n", n, f/n, s/n }' sc6vrr.log
+  grep -v -E 'frames=|metrics_v=' sc6vrr.log | head -20
+  python3 -I "$here/measurements.py" summary . --section dll
 else
   print "no sc6vrr.log (DLL not loaded?)"
 fi
@@ -50,31 +50,29 @@ for k in keys:
 else
   print "none"
 fi
-ls sample-*.txt(N) | sed 's/^/CPU sample: /'
+for f in sample-*.txt(N); do print "CPU sample: $f"; done
+
+section "Frame breakdown (SC6VRR_FRAME_TIMERS)"
+python3 -I "$here/measurements.py" summary . --section detail
+
+section "Thread CPU time (threads.tsv)"
+python3 -I "$here/measurements.py" summary . --section threads
+
+if [[ -f metal-status.json ]]; then
+  section "Native Metal export (metal-status.json)"
+  cat metal-status.json
+fi
 
 section "Game process (proc.tsv)"
-awk -F'\t' 'NR>1 {n++; cpu+=$3; if ($4>rss) rss=$4; if (!first) first=$1; last=$1}
-  END {if (n) printf "samples: %d (%s to %s)\navg cpu: %.0f%%\nmax rss: %.0f MB\n", n, first, last, cpu/n, rss/1024; else print "no samples"}' proc.tsv
+python3 -I "$here/measurements.py" summary . --section cpu
 
 section "Game Mode (gamepolicyd.log)"
 print "lines: $(wc -l < gamepolicyd.log | tr -d ' ')"
 grep -i -E "game ?mode|GameSession|foreground|fullscreen|sc6vrr|wineloader" gamepolicyd.log | tail -15 || true
 [[ -f gamemode-status.txt ]] && { print "status during run:"; cat gamemode-status.txt }
 
-section "Frame rate (Metal HUD frame counter, per log line)"
-# fps = change in the frame counter / change in time between HUD lines.
-awk '/metal-HUD:/ {
-    split($2, hms, ":"); t = hms[1]*3600 + hms[2]*60 + hms[3]
-    sub(/.*metal-HUD: /, ""); split($0, f, ","); n = f[1] + 0
-    if (have && t > pt && n >= pn) {
-      fps = (n - pn) / (t - pt); c++; sum += fps
-      if (!c0 || fps < mn) mn = fps; if (fps > mx) mx = fps; c0 = 1
-      if (fps < 55) low++; if (fps > 65) high++
-    }
-    pt = t; pn = n; have = 1
-  }
-  END { if (c) printf "intervals: %d\navg fps: %.1f  min: %.1f  max: %.1f\nintervals under 55 fps: %d  over 65 fps: %d\n", c, sum/c, mn, mx, low, high
-        else print "no HUD frame data" }' metal.log
+section "Frame rate (Metal HUD counters, separated by process)"
+python3 -I "$here/measurements.py" summary . --section hud
 
 section "Metal cache folders written in this run"
 cat metal-cache-dirs.txt 2>/dev/null
