@@ -854,6 +854,12 @@ static int shader_capture_open(const char *dir) {
   CreateDirectoryA(path, NULL);
   snprintf(path, sizeof(path), "%s\\frames", shader_dir);
   CreateDirectoryA(path, NULL);
+  snprintf(path, sizeof(path), "%s\\depth", shader_dir);
+  CreateDirectoryA(path, NULL);
+  snprintf(path, sizeof(path), "%s\\raster", shader_dir);
+  CreateDirectoryA(path, NULL);
+  snprintf(path, sizeof(path), "%s\\sampler", shader_dir);
+  CreateDirectoryA(path, NULL);
   GetLocalTime(&t);
   snprintf(path, sizeof(path), "%s\\bindings-%04d%02d%02d-%02d%02d%02d-%lu.tsv", shader_dir, t.wYear,
            t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
@@ -1044,6 +1050,84 @@ static HRESULT WINAPI hook_create_blend_state(void *self, const D3D11_BLEND_DESC
   return hr;
 }
 
+/* Depth-stencil, rasterizer, and sampler states. Metal keeps these outside the
+ * render pipeline, so they are not part of the recorded pipeline combinations.
+ * Their descriptions are stored like blend states, and the frame log names the
+ * ones bound at each draw. Index stage codes: dss, rss, sss. */
+static void capture_depth_state(const D3D11_DEPTH_STENCIL_DESC *d, void *state) {
+  char text[512];
+  if (!d)
+    return;
+  int used = snprintf(text, sizeof(text),
+                      "depth_enable\t%d\ndepth_write_mask\t%u\ndepth_func\t%u\nstencil_enable\t%d\n"
+                      "stencil_read_mask\t%u\nstencil_write_mask\t%u\n"
+                      "front\t%u\t%u\t%u\t%u\nback\t%u\t%u\t%u\t%u\n",
+                      (int)d->DepthEnable, (unsigned)d->DepthWriteMask, (unsigned)d->DepthFunc,
+                      (int)d->StencilEnable, d->StencilReadMask, d->StencilWriteMask,
+                      (unsigned)d->FrontFace.StencilFailOp, (unsigned)d->FrontFace.StencilDepthFailOp,
+                      (unsigned)d->FrontFace.StencilPassOp, (unsigned)d->FrontFace.StencilFunc,
+                      (unsigned)d->BackFace.StencilFailOp, (unsigned)d->BackFace.StencilDepthFailOp,
+                      (unsigned)d->BackFace.StencilPassOp, (unsigned)d->BackFace.StencilFunc);
+  capture_described_object("depth", "dss",
+                           "# front/back: stencil_fail depth_fail pass func (D3D11 enum values)\n", text,
+                           (size_t)used, state, 0);
+}
+
+static void capture_raster_state(const D3D11_RASTERIZER_DESC *d, void *state) {
+  char text[512];
+  if (!d)
+    return;
+  int used = snprintf(text, sizeof(text),
+                      "fill\t%u\ncull\t%u\nfront_counter_clockwise\t%d\ndepth_bias\t%d\ndepth_bias_clamp\t%g\n"
+                      "slope_scaled_depth_bias\t%g\ndepth_clip\t%d\nscissor\t%d\nmultisample\t%d\n"
+                      "antialiased_line\t%d\n",
+                      (unsigned)d->FillMode, (unsigned)d->CullMode, (int)d->FrontCounterClockwise, d->DepthBias,
+                      d->DepthBiasClamp, d->SlopeScaledDepthBias, (int)d->DepthClipEnable, (int)d->ScissorEnable,
+                      (int)d->MultisampleEnable, (int)d->AntialiasedLineEnable);
+  capture_described_object("raster", "rss", "# D3D11 enum values\n", text, (size_t)used, state, 0);
+}
+
+static void capture_sampler_state(const D3D11_SAMPLER_DESC *d, void *state) {
+  char text[512];
+  if (!d)
+    return;
+  int used = snprintf(text, sizeof(text),
+                      "filter\t%u\naddress\t%u\t%u\t%u\nmip_lod_bias\t%g\nmax_anisotropy\t%u\ncomparison\t%u\n"
+                      "border_color\t%g\t%g\t%g\t%g\nlod_range\t%g\t%g\n",
+                      (unsigned)d->Filter, (unsigned)d->AddressU, (unsigned)d->AddressV, (unsigned)d->AddressW,
+                      d->MipLODBias, d->MaxAnisotropy, (unsigned)d->ComparisonFunc, d->BorderColor[0],
+                      d->BorderColor[1], d->BorderColor[2], d->BorderColor[3], d->MinLOD, d->MaxLOD);
+  capture_described_object("sampler", "sss", "# D3D11 enum values; address is u v w\n", text, (size_t)used,
+                           state, 0);
+}
+
+typedef HRESULT(WINAPI *create_depth_state_fn)(void *self, const D3D11_DEPTH_STENCIL_DESC *desc, void **out);
+typedef HRESULT(WINAPI *create_raster_state_fn)(void *self, const D3D11_RASTERIZER_DESC *desc, void **out);
+typedef HRESULT(WINAPI *create_sampler_state_fn)(void *self, const D3D11_SAMPLER_DESC *desc, void **out);
+static create_depth_state_fn orig_create_depth_state;
+static create_raster_state_fn orig_create_raster_state;
+static create_sampler_state_fn orig_create_sampler_state;
+
+static HRESULT WINAPI hook_create_depth_state(void *self, const D3D11_DEPTH_STENCIL_DESC *desc, void **out) {
+  HRESULT hr = orig_create_depth_state(self, desc, out);
+  if (SUCCEEDED(hr) && out && *out)
+    capture_depth_state(desc, *out);
+  return hr;
+}
+static HRESULT WINAPI hook_create_raster_state(void *self, const D3D11_RASTERIZER_DESC *desc, void **out) {
+  HRESULT hr = orig_create_raster_state(self, desc, out);
+  if (SUCCEEDED(hr) && out && *out)
+    capture_raster_state(desc, *out);
+  return hr;
+}
+static HRESULT WINAPI hook_create_sampler_state(void *self, const D3D11_SAMPLER_DESC *desc, void **out) {
+  HRESULT hr = orig_create_sampler_state(self, desc, out);
+  if (SUCCEEDED(hr) && out && *out)
+    capture_sampler_state(desc, *out);
+  return hr;
+}
+
+
 /* Everything a Metal render pipeline depends on, for one draw: the shaders, the
  * vertex layout and strides, the primitive class, the target formats, and the
  * blend state. All fields are 4 bytes, so there is no padding, and memcmp and
@@ -1157,7 +1241,7 @@ static volatile LONG frame_state;
 static FILE *frame_file;
 static uint64_t frame_calls, frames_logged;
 static int frame_key_was_down;
-static uint32_t bound_cs;
+static uint32_t bound_cs, bound_depth_state, bound_raster_state, bound_stencil_ref;
 
 static int real_frame_key_down(void) { return (GetAsyncKeyState(VK_F10) & 0x8000) != 0; }
 static int (*frame_key_down)(void) = real_frame_key_down; /* the test replaces it */
@@ -1237,15 +1321,19 @@ static void short_id(uint32_t id, char out[65]) {
 }
 
 static void frame_draw(const char *kind, const char *args) {
-  char layout[65], vs[65], gs[65], ps[65], blend[65], rts[128];
+  char layout[65], vs[65], gs[65], ps[65], blend[65], rts[128], depth[65], raster[65];
+  short_id(bound_depth_state, depth);
+  short_id(bound_raster_state, raster);
   short_id(bound.layout, layout);
   short_id(bound.vs, vs);
   short_id(bound.gs, gs);
   short_id(bound.ps, ps);
   short_id(bound.blend, blend);
   join_uints(rts, sizeof(rts), bound.rt_formats, bound.rt_count, 0xFF, 0);
-  frame_line("%s\t%s\ttopology=%u\tlayout=%s\tvs=%s\tgs=%s\tps=%s\tblend=%s\trt_formats=%s\tdsv_format=%u", kind,
-             args, bound.topology, layout, vs, gs, ps, blend, rts, bound.dsv_format);
+  frame_line("%s\t%s\ttopology=%u\tlayout=%s\tvs=%s\tgs=%s\tps=%s\tblend=%s\trt_formats=%s\tdsv_format=%u"
+             "\tdepth_state=%s\tstencil_ref=%u\traster=%s",
+             kind, args, bound.topology, layout, vs, gs, ps, blend, rts, bound.dsv_format, depth, bound_stencil_ref,
+             raster);
 }
 
 #define FRAME_LOGGING_NOW (frame_state == FRAME_LOGGING)
@@ -1311,7 +1399,8 @@ enum {
   CTX_TARGETS_UAVS, CTX_BLEND, CTX_DRAW, CTX_DRAW_INDEXED, CTX_DRAW_INDEXED_INSTANCED, CTX_DRAW_INSTANCED,
   CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_CS_SET, CTX_PS_SRV, CTX_CS_SRV,
   CTX_CS_UAV, CTX_CLEAR_RTV, CTX_CLEAR_DSV, CTX_VIEWPORTS, CTX_DISPATCH, CTX_DISPATCH_INDIRECT, CTX_COPY_RESOURCE,
-  CTX_COPY_REGION, CTX_RESOLVE, CTX_COUNT
+  CTX_COPY_REGION, CTX_RESOLVE, CTX_DEPTH_STATE, CTX_RASTER_STATE, CTX_VS_SRV, CTX_PS_SAMPLERS, CTX_VS_SAMPLERS,
+  CTX_CS_SAMPLERS, CTX_COUNT
 };
 static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(VSSetShader), CONTEXT_SLOT(GSSetShader), CONTEXT_SLOT(PSSetShader),
@@ -1323,14 +1412,17 @@ static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(PSSetShaderResources), CONTEXT_SLOT(CSSetShaderResources), CONTEXT_SLOT(CSSetUnorderedAccessViews),
     CONTEXT_SLOT(ClearRenderTargetView), CONTEXT_SLOT(ClearDepthStencilView), CONTEXT_SLOT(RSSetViewports),
     CONTEXT_SLOT(Dispatch), CONTEXT_SLOT(DispatchIndirect), CONTEXT_SLOT(CopyResource),
-    CONTEXT_SLOT(CopySubresourceRegion), CONTEXT_SLOT(ResolveSubresource)};
+    CONTEXT_SLOT(CopySubresourceRegion), CONTEXT_SLOT(ResolveSubresource), CONTEXT_SLOT(OMSetDepthStencilState),
+    CONTEXT_SLOT(RSSetState), CONTEXT_SLOT(VSSetShaderResources), CONTEXT_SLOT(PSSetSamplers),
+    CONTEXT_SLOT(VSSetSamplers), CONTEXT_SLOT(CSSetSamplers)};
 static const char *const kContextNames[CTX_COUNT] = {
     "VSSetShader", "GSSetShader", "PSSetShader", "IASetInputLayout", "IASetPrimitiveTopology",
     "IASetVertexBuffers", "OMSetRenderTargets", "OMSetRenderTargetsAndUnorderedAccessViews", "OMSetBlendState",
     "Draw", "DrawIndexed", "DrawIndexedInstanced", "DrawInstanced", "DrawAuto", "DrawIndexedInstancedIndirect",
     "DrawInstancedIndirect", "CSSetShader", "PSSetShaderResources", "CSSetShaderResources",
     "CSSetUnorderedAccessViews", "ClearRenderTargetView", "ClearDepthStencilView", "RSSetViewports", "Dispatch",
-    "DispatchIndirect", "CopyResource", "CopySubresourceRegion", "ResolveSubresource"};
+    "DispatchIndirect", "CopyResource", "CopySubresourceRegion", "ResolveSubresource", "OMSetDepthStencilState",
+    "RSSetState", "VSSetShaderResources", "PSSetSamplers", "VSSetSamplers", "CSSetSamplers"};
 static void *orig_context[CTX_COUNT];
 
 /* Reads the formats of the bound views. A view's format can differ from its
@@ -1589,6 +1681,51 @@ static void WINAPI hook_resolve(void *ctx, void *dst, UINT dst_sub, void *src, U
   ((resolve_fn)orig_context[CTX_RESOLVE])(ctx, dst, dst_sub, src, src_sub, format);
 }
 
+typedef void(WINAPI *set_depth_state_fn)(void *ctx, void *state, UINT stencil_ref);
+typedef void(WINAPI *set_raster_state_fn)(void *ctx, void *state);
+typedef void(WINAPI *set_samplers_fn)(void *ctx, UINT start, UINT count, void *const *samplers);
+
+static void WINAPI hook_depth_state_set(void *ctx, void *state, UINT stencil_ref) {
+  bound_depth_state = object_lookup(state, NULL);
+  bound_stencil_ref = stencil_ref;
+  ((set_depth_state_fn)orig_context[CTX_DEPTH_STATE])(ctx, state, stencil_ref);
+}
+static void WINAPI hook_raster_state_set(void *ctx, void *state) {
+  bound_raster_state = object_lookup(state, NULL);
+  ((set_raster_state_fn)orig_context[CTX_RASTER_STATE])(ctx, state);
+}
+static void WINAPI hook_vs_srv_set(void *ctx, UINT start, UINT count, void *const *views) {
+  if (FRAME_LOGGING_NOW)
+    describe_views("VSSetShaderResources", start, count, views);
+  ((set_views_fn)orig_context[CTX_VS_SRV])(ctx, start, count, views);
+}
+
+/* Logs the content IDs of the samplers bound to one stage. */
+static void log_samplers(const char *call, UINT start, UINT count, void *const *samplers) {
+  char line[2048], id[65];
+  size_t used = (size_t)snprintf(line, sizeof(line), "%s\tstart=%u\tcount=%u", call, start, count);
+  for (UINT i = 0; samplers && i < count && used < sizeof(line); i++) {
+    short_id(object_lookup(samplers[i], NULL), id);
+    used += (size_t)snprintf(line + used, sizeof(line) - used, "\t%u=%s", start + i, id);
+  }
+  frame_line("%s", line);
+}
+static void WINAPI hook_ps_samplers_set(void *ctx, UINT start, UINT count, void *const *samplers) {
+  if (FRAME_LOGGING_NOW)
+    log_samplers("PSSetSamplers", start, count, samplers);
+  ((set_samplers_fn)orig_context[CTX_PS_SAMPLERS])(ctx, start, count, samplers);
+}
+static void WINAPI hook_vs_samplers_set(void *ctx, UINT start, UINT count, void *const *samplers) {
+  if (FRAME_LOGGING_NOW)
+    log_samplers("VSSetSamplers", start, count, samplers);
+  ((set_samplers_fn)orig_context[CTX_VS_SAMPLERS])(ctx, start, count, samplers);
+}
+static void WINAPI hook_cs_samplers_set(void *ctx, UINT start, UINT count, void *const *samplers) {
+  if (FRAME_LOGGING_NOW)
+    log_samplers("CSSetSamplers", start, count, samplers);
+  ((set_samplers_fn)orig_context[CTX_CS_SAMPLERS])(ctx, start, count, samplers);
+}
+
 /* Replaces vtable pointers instead of patching the methods' code. Under
  * CrossOver Preview with FEX, d3d11.dll is ARM64EC: its methods are native
  * ARM64 code, so an x64 jump written over them is an illegal instruction
@@ -1696,7 +1833,7 @@ static int install_frame_log(void *create_factory, void *create_factory1) {
 typedef void(WINAPI *get_context_fn)(void *device, void **context);
 typedef ULONG(WINAPI *release_fn)(void *object);
 
-enum { CREATE_IL = STAGE_COUNT, CREATE_BLEND, CREATE_COUNT };
+enum { CREATE_IL = STAGE_COUNT, CREATE_BLEND, CREATE_DEPTH, CREATE_RASTER, CREATE_SAMPLER, CREATE_COUNT };
 
 static void install_device_shader_hooks(void *device) {
   if (!device || InterlockedCompareExchange(&shader_hooks_installed, 1, 0))
@@ -1704,7 +1841,8 @@ static void install_device_shader_hooks(void *device) {
   void **vtable = *(void ***)device;
   void *create_hooks[CREATE_COUNT] = {hook_create_VS, hook_create_GS, hook_create_GS_SO,       hook_create_PS,
                                       hook_create_HS, hook_create_DS, hook_create_CS,          hook_create_input_layout,
-                                      hook_create_blend_state};
+                                      hook_create_blend_state, hook_create_depth_state, hook_create_raster_state,
+                                      hook_create_sampler_state};
   int create_slots[CREATE_COUNT];
   const char *create_names[CREATE_COUNT];
   void *create_originals[CREATE_COUNT];
@@ -1716,6 +1854,12 @@ static void install_device_shader_hooks(void *device) {
   create_names[CREATE_IL] = "il";
   create_slots[CREATE_BLEND] = DEVICE_SLOT(CreateBlendState);
   create_names[CREATE_BLEND] = "bs";
+  create_slots[CREATE_DEPTH] = DEVICE_SLOT(CreateDepthStencilState);
+  create_names[CREATE_DEPTH] = "dss";
+  create_slots[CREATE_RASTER] = DEVICE_SLOT(CreateRasterizerState);
+  create_names[CREATE_RASTER] = "rss";
+  create_slots[CREATE_SAMPLER] = DEVICE_SLOT(CreateSamplerState);
+  create_names[CREATE_SAMPLER] = "sss";
   if (!swap_vtable_slots(vtable, create_slots, create_hooks, create_originals, CREATE_COUNT, create_names))
     return;
   for (int i = 0; i < STAGE_COUNT; i++) {
@@ -1726,6 +1870,9 @@ static void install_device_shader_hooks(void *device) {
   }
   orig_create_input_layout = (create_input_layout_fn)create_originals[CREATE_IL];
   orig_create_blend_state = (create_blend_state_fn)create_originals[CREATE_BLEND];
+  orig_create_depth_state = (create_depth_state_fn)create_originals[CREATE_DEPTH];
+  orig_create_raster_state = (create_raster_state_fn)create_originals[CREATE_RASTER];
+  orig_create_sampler_state = (create_sampler_state_fn)create_originals[CREATE_SAMPLER];
 
   /* GetImmediateContext adds a reference, so release it after hooking. */
   void *context = NULL;
@@ -1742,7 +1889,9 @@ static void install_device_shader_hooks(void *device) {
       hook_draw_instanced, hook_draw_auto,   hook_draw_indexed_indirect, hook_draw_instanced_indirect,
       hook_cs_set,      hook_ps_srv_set,     hook_cs_srv_set,   hook_cs_uav_set,
       hook_clear_rtv,   hook_clear_dsv,      hook_viewports_set, hook_dispatch,
-      hook_dispatch_indirect, hook_copy_resource, hook_copy_region, hook_resolve};
+      hook_dispatch_indirect, hook_copy_resource, hook_copy_region, hook_resolve,
+      hook_depth_state_set, hook_raster_state_set, hook_vs_srv_set, hook_ps_samplers_set,
+      hook_vs_samplers_set, hook_cs_samplers_set};
   swap_vtable_slots(context_vtable, kContextSlots, context_hooks, orig_context, CTX_COUNT, kContextNames);
   ((release_fn)context_vtable[2])(context);
 }

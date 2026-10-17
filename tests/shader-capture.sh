@@ -83,15 +83,14 @@ out = pathlib.Path(sys.argv[1])
 indexes = sorted(out.glob('index-*.tsv'))
 if not indexes:
     sys.exit('No index files yet.')
-calls, failed, unique, layouts, blends = 0, 0, {}, set(), set()
+calls, failed, unique, states = 0, 0, {}, collections.defaultdict(set)
+SHADER_STAGES = {'vs', 'gs', 'gs_so', 'ps', 'hs', 'ds', 'cs'}
 for path in indexes:
     with path.open(newline='') as f:
         for row in csv.DictReader(f, delimiter='\t'):
-            if row['stage'] == 'il':
-                layouts.add(row['sha256'])
-                continue
-            if row['stage'] == 'bs':
-                blends.add(row['sha256'])
+            # Non-shader rows: il input layout, bs blend, dss depth-stencil, rss rasterizer, sss sampler.
+            if row['stage'] not in SHADER_STAGES:
+                states[row['stage']].add(row['sha256'])
                 continue
             calls += 1
             failed += int(row['hresult'], 16) >= 0x80000000
@@ -103,7 +102,8 @@ print(f'{len(unique)} unique shaders in the index, {len(files)} files in dxbc/')
 print(f'{sum(p.stat().st_size for p in files) / 1e6:.1f} MB of bytecode')
 for (stage, model), n in sorted(models.items()):
     print(f'  {stage:6} {model:10} {n}')
-print(f'{len(layouts)} unique input layouts, {len(blends)} unique blend states')
+print(f'unique states: {len(states["il"])} input layouts, {len(states["bs"])} blend, {len(states["dss"])} depth-stencil, '
+      f'{len(states["rss"])} rasterizer, {len(states["sss"])} sampler')
 
 combos, pairs = set(), set()
 for path in sorted(out.glob('bindings-*.tsv')):

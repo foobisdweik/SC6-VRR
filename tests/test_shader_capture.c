@@ -173,6 +173,24 @@ static __attribute__((noinline)) HRESULT WINAPI fake_create_factory1(REFIID riid
   *out = &fake_factory;
   return S_OK;
 }
+/* Fake state creation and binding, for the depth, rasterizer, and sampler records. */
+static __attribute__((noinline)) HRESULT WINAPI fake_create_state(void *self, const void *desc, void **out) {
+  (void)self, (void)desc;
+  *out = NEW_OBJECT();
+  return S_OK;
+}
+static __attribute__((noinline)) void WINAPI fake_set_depth_state(void *ctx, void *state, UINT ref) {
+  (void)ctx, (void)state, (void)ref;
+  fake_frame_calls++;
+}
+static __attribute__((noinline)) void WINAPI fake_set_state(void *ctx, void *state) {
+  (void)ctx, (void)state;
+  fake_frame_calls++;
+}
+static __attribute__((noinline)) void WINAPI fake_set_list(void *ctx, UINT start, UINT n, void *const *items) {
+  (void)ctx, (void)start, (void)n, (void)items;
+  fake_frame_calls++;
+}
 static int fake_key;
 static int fake_key_down(void) { return fake_key; }
 
@@ -269,6 +287,13 @@ int main(void) {
   fake_context_vtable[CONTEXT_SLOT(ClearRenderTargetView)] = fake_clear_rtv;
   fake_context_vtable[CONTEXT_SLOT(Dispatch)] = fake_dispatch;
   fake_swapchain_vtable[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)] = fake_present;
+  fake_vtable[DEVICE_SLOT(CreateDepthStencilState)] = fake_create_state;
+  fake_vtable[DEVICE_SLOT(CreateRasterizerState)] = fake_create_state;
+  fake_vtable[DEVICE_SLOT(CreateSamplerState)] = fake_create_state;
+  fake_context_vtable[CONTEXT_SLOT(OMSetDepthStencilState)] = fake_set_depth_state;
+  fake_context_vtable[CONTEXT_SLOT(RSSetState)] = fake_set_state;
+  fake_context_vtable[CONTEXT_SLOT(VSSetShaderResources)] = fake_set_list;
+  fake_context_vtable[CONTEXT_SLOT(PSSetSamplers)] = fake_set_list;
   fake_factory_vtable[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)] = fake_create_swapchain;
 
   char dir[MAX_PATH], path[MAX_PATH + 128];
@@ -431,6 +456,32 @@ int main(void) {
   dispatch_fn dispatch = (dispatch_fn)cvt[CONTEXT_SLOT(Dispatch)];
   FLOAT black[4] = {0, 0, 0, 1};
 
+  /* States: each description is stored once, and draws name the bound ones. */
+  D3D11_DEPTH_STENCIL_DESC depth_desc = {0};
+  depth_desc.DepthEnable = TRUE, depth_desc.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+  D3D11_RASTERIZER_DESC raster_desc = {0};
+  raster_desc.FillMode = D3D11_FILL_SOLID, raster_desc.CullMode = D3D11_CULL_BACK;
+  D3D11_SAMPLER_DESC sampler_desc = {0};
+  sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+  void *depth_state = NULL, *raster_state = NULL, *sampler = NULL;
+  assert(((create_depth_state_fn)vt[DEVICE_SLOT(CreateDepthStencilState)])(device, &depth_desc, &depth_state) == S_OK);
+  assert(((create_raster_state_fn)vt[DEVICE_SLOT(CreateRasterizerState)])(device, &raster_desc, &raster_state) == S_OK);
+  assert(((create_sampler_state_fn)vt[DEVICE_SLOT(CreateSamplerState)])(device, &sampler_desc, &sampler) == S_OK);
+  char depth_hex[65], raster_hex[65], sampler_hex[65];
+  id_hex(object_lookup(depth_state, NULL), depth_hex);
+  id_hex(object_lookup(raster_state, NULL), raster_hex);
+  id_hex(object_lookup(sampler, NULL), sampler_hex);
+  depth_hex[16] = raster_hex[16] = sampler_hex[16] = 0;
+  snprintf(path, sizeof(path), "%s\\depth\\%s*.txt", dir, depth_hex);
+  h = FindFirstFileA(path, &found);
+  assert(h != INVALID_HANDLE_VALUE);
+  FindClose(h);
+  set_depth_state_fn depth_set = (set_depth_state_fn)cvt[CONTEXT_SLOT(OMSetDepthStencilState)];
+  set_raster_state_fn raster_set = (set_raster_state_fn)cvt[CONTEXT_SLOT(RSSetState)];
+  set_views_fn vs_srv_set = (set_views_fn)cvt[CONTEXT_SLOT(VSSetShaderResources)];
+  set_samplers_fn ps_samplers_set = (set_samplers_fn)cvt[CONTEXT_SLOT(PSSetSamplers)];
+  void *vs_views[1] = {&fake_rtv};               /* any view whose resource is the fake texture */
+
   assert(present(&fake_swapchain, 1, 0) == S_OK && frame_state == FRAME_IDLE);
   clear_rtv(&fake_context, &fake_rtv, black);      /* not logged: no frame armed */
   fake_key = 1;
@@ -442,12 +493,16 @@ int main(void) {
   ps_set(&fake_context, ps_object, NULL, 0);
   targets_set(&fake_context, 1, rtvs, &fake_dsv);
   clear_rtv(&fake_context, &fake_rtv, black);
+  depth_set(&fake_context, depth_state, 7);         /* not logged by itself; named at the draw */
+  raster_set(&fake_context, raster_state);
+  vs_srv_set(&fake_context, 0, 1, vs_views);
+  ps_samplers_set(&fake_context, 2, 1, &sampler);
   draw_indexed(&fake_context, 36, 0, 0);
   dispatch(&fake_context, 8, 4, 1);
   present(&fake_swapchain, 1, 0);                   /* frame ends */
   assert(frame_state == FRAME_IDLE && !frame_file && frames_logged == 1);
   present(&fake_swapchain, 1, 0);
-  assert(frame_state == FRAME_IDLE && frames_logged == 1 && presents == 5 && fake_frame_calls == 3);
+  assert(frame_state == FRAME_IDLE && frames_logged == 1 && presents == 5 && fake_frame_calls == 7);
   assert(texture_refs == 0);                        /* every GetResource was released */
 
   snprintf(path, sizeof(path), "%s\\frames\\frame-*.tsv", dir);
@@ -461,16 +516,24 @@ int main(void) {
       "0\tFrameStart\t",
       "1\tOMSetRenderTargets\tcount=1\trt0=tex2d:",
       "2\tClearRenderTargetView\ttex2d:",
-      "3\tDrawIndexed\tcount=36 start=0 base=0\ttopology=4\t",
-      "4\tDispatch\tgroups=8,4,1\tcs=none",
-      "5\tPresent",
+      "3\tVSSetShaderResources\tstart=0\tcount=1\t0=tex2d:",
+      "4\tPSSetSamplers\tstart=2\tcount=1\t2=",
+      "5\tDrawIndexed\tcount=36 start=0 base=0\ttopology=4\t",
+      "6\tDispatch\tgroups=8,4,1\tcs=none",
+      "7\tPresent",
   };
   for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
     assert(fgets(line, sizeof(line), f));
     assert(!strncmp(line, expected[i], strlen(expected[i])));
     if (i == 2)
       assert(strstr(line, ":1920x1080:format=10:mips=1:array=1:samples=1") && strstr(line, "\tdepth=tex2d:"));
-    if (i == 4) {
+    /* expected[0] is the header, so entry i holds log line i - 1. */
+    if (i == 5)
+      assert(strstr(line, sampler_hex));
+    if (i == 6) {
+      char states[200];
+      snprintf(states, sizeof(states), "\tdepth_state=%s\tstencil_ref=7\traster=%s", depth_hex, raster_hex);
+      assert(strstr(line, states));
       char vs_short[17], ps_short[17], expect_ids[64];
       memcpy(vs_short, vs_hex, 16), vs_short[16] = 0;
       memcpy(ps_short, ps_hex, 16), ps_short[16] = 0;

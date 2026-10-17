@@ -212,6 +212,13 @@ Path 2 (DXBC to DXIL, then Metal Shader Converter) has not been tested.
 Both react to the same key at the next frame, so they describe the same frame or adjacent ones. Texture addresses identify resources only within one frame log.
 The fake-device test covers the key edge, the frame boundaries, released resource references, and the logged lines.
 
+### Frame log additions for the specification gaps (2026-10-17, not yet run in the game)
+
+The DLL now also records depth-stencil, rasterizer, and sampler states. Each unique description goes to `depth/`, `raster/`, or `sampler/` (index stage codes `dss`, `rss`, `sss`). Metal keeps these states outside the render pipeline, so they do not change the recorded pipeline combinations.
+In the frame log, each draw now names its depth-stencil state, stencil reference value, and rasterizer state. The log also lists vertex shader texture bindings and the samplers bound for pixel, vertex, and compute shaders.
+Clear lines already named their target, so `tests/frame_passes.py` now prints each clear with its target and value, plus each pass's states and sampler count.
+Constant data is still not recorded.
+
 ### First frame capture (2026-10-17, Training)
 
 Both captures worked. The DLL wrote a 2,912-call frame log, and DXMT wrote `SoulcaliburVI_F.2458_*.gputrace` (frame 2458). Both are in the private `frames/` folder. `tests/frame_passes.py` splits a frame log into passes, where a pass starts whenever the render or depth targets change.

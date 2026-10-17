@@ -64,7 +64,8 @@ def main() -> None:
             key = (targets, depth)
             if current is None or current['key'] != key:
                 current = {'key': key, 'start': int(f[0]), 'draws': collections.Counter(), 'indices': 0,
-                           'clears': [], 'dispatches': 0, 'reads': set(), 'ps': set(), 'viewport': None}
+                           'clears': [], 'dispatches': 0, 'reads': set(), 'ps': set(), 'viewport': None,
+                           'depth_states': set(), 'rasters': set(), 'samplers': set()}
                 passes.append(current)
             continue
         if current is None:
@@ -73,17 +74,23 @@ def main() -> None:
             current['draws'][call] += 1
             m = re.search(r'count=(\d+)', f[2])
             current['indices'] += int(m.group(1)) if m else 0
-            ps = next((x[3:] for x in f if x.startswith('ps=')), 'none')
-            current['ps'].add(ps)
+            fields = dict(x.split('=', 1) for x in f[3:] if '=' in x)
+            current['ps'].add(fields.get('ps', 'none'))
+            if 'depth_state' in fields:
+                current['depth_states'].add(f"{fields['depth_state'][:8]}/ref{fields.get('stencil_ref', '?')}")
+                current['rasters'].add(fields.get('raster', 'none')[:8])
             for t in current['key'][0] + (current['key'][1],):
                 if t != 'none':
                     written.add(t)
         elif call in ('ClearRenderTargetView', 'ClearDepthStencilView'):
-            current['clears'].append(names.name(f[2]) or 'none')
+            value = ' '.join(f[3:]).replace('color=', '')
+            current['clears'].append(f'{names.name(f[2]) or "none"}({value})')
             written.add(names.name(f[2]) or 'none')
         elif call.startswith('Dispatch'):
             current['dispatches'] += 1
-        elif call in ('PSSetShaderResources', 'CSSetShaderResources'):
+        elif call in ('PSSetSamplers', 'VSSetSamplers', 'CSSetSamplers'):
+            current['samplers'].update(x.split('=', 1)[1][:8] for x in f[4:] if '=' in x and not x.endswith('=none'))
+        elif call in ('PSSetShaderResources', 'CSSetShaderResources', 'VSSetShaderResources'):
             for x in f[4:]:
                 t = names.name(x)
                 if t and t in written:
@@ -105,12 +112,16 @@ def main() -> None:
             work.append(f'clears {",".join(p["clears"])}')
         if p['dispatches']:
             work.append(f'{p["dispatches"]} dispatches')
+        if p['depth_states']:
+            work.append(f'depth states {",".join(sorted(p["depth_states"]))}; raster {",".join(sorted(p["rasters"]))}')
+        if p['samplers']:
+            work.append(f'{len(p["samplers"])} samplers')
         reads = f'  reads {",".join(sorted(p["reads"], key=lambda t: int(t[1:])))}' if p['reads'] else ''
         print(f'{i:3}. call {p["start"]:5}  targets {",".join(targets)}  depth {depth}  '
               f'viewport {p["viewport"] or "-"}')
         print(f'      {"; ".join(work)}{reads}')
     print()
-    print('Textures:')
+    print('Textures (formats are DXGI names; TYPELESS targets are viewed with a concrete format):')
     for name, info in names.info.items():
         print(f'  {name:5} {info}')
 
