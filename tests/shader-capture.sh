@@ -5,6 +5,11 @@
 #        tests/shader-capture.sh launch    start SC6 with capture on
 #        tests/shader-capture.sh launch-fast  the same, with the frame rate and
 #                                          the battle speed uncapped
+#        tests/shader-capture.sh launch-frame  the same at normal speed, with
+#                                          DXMT's Metal capture on; F10 in the
+#                                          game logs one frame both ways
+#        tests/shader-capture.sh frames    move Metal captures into the private
+#                                          folder and list the frame logs
 #        tests/shader-capture.sh summary   count the recorded shaders
 #        tests/shader-capture.sh remove    delete the DLL from the game folder
 #
@@ -41,7 +46,7 @@ case ${1:-} in
     print "installed: $dll"
     print "sha256: $(shasum -a 256 $dll | cut -d' ' -f1)"
     ;;
-  launch|launch-fast)
+  launch|launch-fast|launch-frame)
     game_running && { print "SC6 is already running."; exit 1; }
     cmp -s $dll $repo/dll/build/dinput8.dll || { print "Run '$0 install' first."; exit 1; }
     mkdir -p $out
@@ -51,10 +56,25 @@ case ${1:-} in
     # battle advances one step per rendered frame, so it runs faster than
     # normal, limited by how fast the game renders (about 80 fps measured).
     [[ $1 == launch-fast ]] && env_arg+=" SC6VRR_FRAME_MODS=1 SC6VRR_UNCAP=1 SC6VRR_MAX_FPS=240"
+    # DXMT starts a Metal capture of the next frame when F10 is pressed, if
+    # Metal capture is enabled and the executable name matches. It writes a
+    # .gputrace into the game's working folder; the frames command moves it.
+    [[ $1 == launch-frame ]] && env_arg+=" MTL_CAPTURE_ENABLED=1 DXMT_CAPTURE_EXECUTABLE=SoulcaliburVI"
     env_arg=${env_arg//\\/\\\\}
     "$wine" --bottle $bottle --env "$env_arg" --workdir "${exe:h}" --start "$exe" > $out/wine-$stamp.log 2>&1 &
     print "Launched in $bottle. Log: $out/sc6vrr-$stamp.log"
-    print "Visit the scenes to record: menus, Training on several stages, and several characters."
+    if [[ $1 == launch-frame ]]; then
+      print "In a battle, press F10 once (on a Mac keyboard, fn+F10). Then quit and run: $0 frames"
+    else
+      print "Visit the scenes to record: menus, Training on several stages, and several characters."
+    fi
+    ;;
+  frames)
+    game_running && { print "SC6 is running. Quit it first."; exit 1; }
+    mkdir -p $out/frames
+    for trace in $win64/*.gputrace(N); do mv "$trace" $out/frames/ && print "moved: ${trace:t}"; done
+    print "Frame logs and Metal captures in $out/frames:"
+    ls -l $out/frames
     ;;
   summary)
     python3 -I - $out <<'PY'

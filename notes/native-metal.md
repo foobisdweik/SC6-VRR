@@ -202,6 +202,56 @@ Still open in step 3: the 775 pixel shaders without a recorded pair, which more 
 
 Path 2 (DXBC to DXIL, then Metal Shader Converter) has not been tested.
 
+## Step 2 setup: one-frame capture (2026-10-17, not yet run in the game)
+
+`tests/shader-capture.sh launch-frame` starts SC6 at normal speed with two captures armed. Pressing F10 in a battle triggers both:
+
+1. **The DLL's frame log.** It hooks `IDXGISwapChain::Present` through `CreateDXGIFactory`/`CreateDXGIFactory1` and the swap chain's vtable. The key press arms the log at one Present, and the log covers the next full frame up to the following Present. It records, in call order: render target and depth bindings (texture address, size, format, mips, array size, samples), shader resource and unordered access view bindings, clears, viewports, copies, resolves, compute dispatches, and each draw with its counts and pipeline (16-digit hash prefixes, matching the shader and binding files). The output goes to `frames/frame-*.tsv`.
+2. **DXMT's Metal capture.** `MTL_CAPTURE_ENABLED=1` and `DXMT_CAPTURE_EXECUTABLE=SoulcaliburVI` make the DXMT in CrossOver Preview capture the next frame to a `.gputrace` document that Xcode opens. `tests/shader-capture.sh frames` moves it into the private `frames/` folder. The capture is probably written to the game's working folder; this is unverified.
+
+Both react to the same key at the next frame, so they describe the same frame or adjacent ones. Texture addresses identify resources only within one frame log.
+The fake-device test covers the key edge, the frame boundaries, released resource references, and the logged lines.
+
+### First frame capture (2026-10-17, Training)
+
+Both captures worked. The DLL wrote a 2,912-call frame log, and DXMT wrote `SoulcaliburVI_F.2458_*.gputrace` (frame 2458). Both are in the private `frames/` folder. `tests/frame_passes.py` splits a frame log into passes, where a pass starts whenever the render or depth targets change.
+
+The frame has 94 passes with work, 982 draws, and 4 compute dispatches. It reads 404 textures, most of them block-compressed (BC1, BC3, BC5) material textures.
+The game rendered at 640x360, the resolution in the user's settings (`ResolutionSizeX=640`). The 200% resolution scale in the settings did not enlarge the render targets; the reason is unverified.
+
+The pass names below are my reading, based on UE4 4.17's deferred renderer. They match the targets, formats, and dependencies, but they are not confirmed:
+
+| Passes | Probable stage | Evidence |
+| --- | --- | --- |
+| 1 | Depth prepass | 277 draws into depth only (`T4`, 640x360, 24-bit depth with stencil) |
+| 2 | Hierarchical depth buffer | 512x256 `R16F` with 9 mips, reads the depth |
+| 3 | Shadow depths | 95 draws into a 4096x2048 16-bit depth atlas, with 3 dispatches |
+| 4 | Decal buffers (DBuffer) | 3 targets (2 BGRA8, 1 RG8), reads depth |
+| 5 | G-buffer base pass | 317 draws, 39 pixel shaders, 6 targets: `RGBA16F` scene color, `RGB10A2` normals, and 4 BGRA8 targets; reads the decal buffers |
+| 6 | Custom depth | 47 draws into a second 640x360 depth target |
+| 7–11 | Ambient occlusion | 320x180 steps, an `R8` result at 640x360 |
+| 12–19 | Shadow projection and lighting | Stencil clear, light attenuation (BGRA8, reads the shadow atlas), lighting into scene color, 1 dispatch that reads the G-buffer |
+| 20–23 | Screen-space reflections | 320x180 `RGBA16F` steps, composite at 640x360 |
+| 24–28 | Translucency and distortion | 19 + 6 + 2 draws, then composites |
+| 29–35 | Depth of field or motion blur | 320x180 ping-pong between 3 targets, then a 640x360 composite |
+| 36–55 | Bloom and eye adaptation | `R11G11B10F` chain down from 320x180 to 5x6 and back up; a 1x1 `RG32F` exposure target |
+| 57 | Tonemapping | Into `T1`, 640x360 `RGB10A2`, reading the scene and bloom |
+| 58–93 | UI preparation | 36 small passes (for example 133x12 and 83x10), each a clear plus 1 or 2 draws, probably text or widget caches |
+| 94 | UI composite | 88 draws, 13 pixel shaders into `T1` |
+
+For the renderer specification, this frame log is the pass-order source. The `.gputrace` can confirm each pass visually in Xcode.
+
+### Second frame capture: native resolution and a 99% scale (2026-10-17)
+
+The user set the output to the display's 3456x2234 and `sg.ResolutionQuality=99`, then captured frame 4276 (anti-aliasing quality 0).
+
+- The scene targets are 3424x2216, and the output target is 3456x2234. So the 99% scale took effect.
+- The 200% scale in the first capture had no effect, which fits UE4 4.17 limiting the scale to at most 100%. This is unverified.
+- The frame has 95 passes instead of 94. Tonemapping now writes a scene-sized target (3424x2216). Then one extra pass, 3 draws with 3 pixel shaders, writes the 3456x2234 output from it. That pass is the scaling step. In the 100% frame, tonemapping wrote the output directly.
+- The order and kinds of all other passes match the 640x360 frame.
+
+This session also raised the pixel shaders seen in real pairs to 1,246 of 1,936.
+
 ## What done means for the first milestone
 
 The native host draws one replayed battle frame that matches the DXMT capture within a stated image tolerance on an M1 Pro.

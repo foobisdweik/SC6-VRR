@@ -119,6 +119,63 @@ static __attribute__((noinline)) void WINAPI fake_dsv_desc(void *view, D3D11_DEP
 static void *volatile fake_rtv_vtable[16], *volatile fake_dsv_vtable[16];
 static struct { void *volatile *vtable; } fake_rtv = {fake_rtv_vtable}, fake_dsv = {fake_dsv_vtable};
 
+/* A fake 1920x1080 texture behind the views, for the frame log. */
+static unsigned texture_refs;
+static __attribute__((noinline)) ULONG WINAPI fake_texture_release(void *t) { (void)t; return --texture_refs; }
+static __attribute__((noinline)) void WINAPI fake_texture_type(void *t, D3D11_RESOURCE_DIMENSION *type) {
+  (void)t;
+  *type = D3D11_RESOURCE_DIMENSION_TEXTURE2D;
+}
+static __attribute__((noinline)) void WINAPI fake_texture_desc(void *t, D3D11_TEXTURE2D_DESC *d) {
+  (void)t;
+  memset(d, 0, sizeof(*d));
+  d->Width = 1920, d->Height = 1080, d->MipLevels = 1, d->ArraySize = 1;
+  d->Format = DXGI_FORMAT_R16G16B16A16_FLOAT, d->SampleDesc.Count = 1;
+}
+static void *volatile fake_texture_vtable[16];
+static struct { void *volatile *vtable; } fake_texture = {fake_texture_vtable};
+static __attribute__((noinline)) void WINAPI fake_view_resource(void *view, void **resource) {
+  (void)view;
+  texture_refs++;
+  *resource = &fake_texture;
+}
+
+/* Fake context methods that only the frame log hooks. */
+static unsigned fake_frame_calls;
+static __attribute__((noinline)) void WINAPI fake_clear_rtv(void *ctx, void *rtv, const FLOAT c[4]) {
+  (void)ctx, (void)rtv, (void)c;
+  fake_frame_calls++;
+}
+static __attribute__((noinline)) void WINAPI fake_dispatch(void *ctx, UINT x, UINT y, UINT z) {
+  (void)ctx, (void)x, (void)y, (void)z;
+  fake_frame_calls++;
+}
+
+/* A fake DXGI factory and swap chain. */
+static unsigned presents;
+static __attribute__((noinline)) HRESULT WINAPI fake_present(void *sc, UINT sync, UINT flags) {
+  (void)sc, (void)sync, (void)flags;
+  presents++;
+  return S_OK;
+}
+static void *volatile fake_swapchain_vtable[32];
+static struct { void *volatile *vtable; } fake_swapchain = {fake_swapchain_vtable};
+static __attribute__((noinline)) HRESULT WINAPI fake_create_swapchain(void *f, void *dev, DXGI_SWAP_CHAIN_DESC *d,
+                                                                      void **out) {
+  (void)f, (void)dev, (void)d;
+  *out = &fake_swapchain;
+  return S_OK;
+}
+static void *volatile fake_factory_vtable[32];
+static struct { void *volatile *vtable; } fake_factory = {fake_factory_vtable};
+static __attribute__((noinline)) HRESULT WINAPI fake_create_factory1(REFIID riid, void **out) {
+  (void)riid;
+  *out = &fake_factory;
+  return S_OK;
+}
+static int fake_key;
+static int fake_key_down(void) { return fake_key; }
+
 static void *volatile fake_vtable[43];
 static struct { void *volatile *vtable; } fake_device = {fake_vtable};
 static unsigned device_creations;
@@ -204,10 +261,21 @@ int main(void) {
   fake_vtable[DEVICE_SLOT(CreateBlendState)] = fake_create_blend_state;
   fake_rtv_vtable[offsetof(ID3D11RenderTargetViewVtbl, GetDesc) / sizeof(void *)] = fake_rtv_desc;
   fake_dsv_vtable[offsetof(ID3D11DepthStencilViewVtbl, GetDesc) / sizeof(void *)] = fake_dsv_desc;
+  fake_rtv_vtable[offsetof(ID3D11ViewVtbl, GetResource) / sizeof(void *)] = fake_view_resource;
+  fake_dsv_vtable[offsetof(ID3D11ViewVtbl, GetResource) / sizeof(void *)] = fake_view_resource;
+  fake_texture_vtable[offsetof(ID3D11ResourceVtbl, Release) / sizeof(void *)] = fake_texture_release;
+  fake_texture_vtable[offsetof(ID3D11ResourceVtbl, GetType) / sizeof(void *)] = fake_texture_type;
+  fake_texture_vtable[offsetof(ID3D11Texture2DVtbl, GetDesc) / sizeof(void *)] = fake_texture_desc;
+  fake_context_vtable[CONTEXT_SLOT(ClearRenderTargetView)] = fake_clear_rtv;
+  fake_context_vtable[CONTEXT_SLOT(Dispatch)] = fake_dispatch;
+  fake_swapchain_vtable[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)] = fake_present;
+  fake_factory_vtable[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)] = fake_create_swapchain;
 
   char dir[MAX_PATH], path[MAX_PATH + 128];
   GetTempPathA(sizeof(dir) - 40, dir);
-  snprintf(dir + strlen(dir), 40, "sc6vrr-shader-test-%lu", GetCurrentProcessId());
+  /* Wine reuses process IDs, so add the time to keep each run's folder new. */
+  snprintf(dir + strlen(dir), 40, "sc6vrr-shader-test-%lu-%llu", GetCurrentProcessId(),
+           (unsigned long long)GetTickCount64());
   assert(MH_Initialize() == MH_OK);
   assert(shader_capture_open(dir));
   assert(install_shader_capture((void *)fake_create_device, NULL));
@@ -346,6 +414,72 @@ int main(void) {
   fclose(f);
   snprintf(path, sizeof(path), "%s\\blend\\%s.txt", dir, blend_hex);
   assert(file_size(path) > 0);
+
+  /* Frame log: F10 at one Present arms it, the next Present starts it, and the
+   * Present after that ends it. Calls outside that frame are not logged. */
+  frame_key_down = fake_key_down;
+  assert(install_frame_log(NULL, (void *)fake_create_factory1));
+  create_factory_fn volatile create_factory1 = fake_create_factory1;
+  void *factory = NULL, *swapchain = NULL;
+  static const IID any_iid = {0};                  /* the fake factory ignores it */
+  assert(create_factory1(&any_iid, &factory) == S_OK && factory == &fake_factory && factory_hooked);
+  void *volatile *fvt = fake_factory.vtable;
+  assert(((create_swapchain_fn)fvt[offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)])(
+             factory, device, NULL, &swapchain) == S_OK && swapchain == &fake_swapchain && present_hooked);
+  present_fn present = (present_fn)fake_swapchain.vtable[offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)];
+  clear_rtv_fn clear_rtv = (clear_rtv_fn)cvt[CONTEXT_SLOT(ClearRenderTargetView)];
+  dispatch_fn dispatch = (dispatch_fn)cvt[CONTEXT_SLOT(Dispatch)];
+  FLOAT black[4] = {0, 0, 0, 1};
+
+  assert(present(&fake_swapchain, 1, 0) == S_OK && frame_state == FRAME_IDLE);
+  clear_rtv(&fake_context, &fake_rtv, black);      /* not logged: no frame armed */
+  fake_key = 1;
+  present(&fake_swapchain, 1, 0);                   /* F10 pressed: armed */
+  assert(frame_state == FRAME_ARMED);
+  present(&fake_swapchain, 1, 0);                   /* key held: logging starts, no second arm */
+  assert(frame_state == FRAME_LOGGING && frame_file);
+  fake_key = 0;
+  ps_set(&fake_context, ps_object, NULL, 0);
+  targets_set(&fake_context, 1, rtvs, &fake_dsv);
+  clear_rtv(&fake_context, &fake_rtv, black);
+  draw_indexed(&fake_context, 36, 0, 0);
+  dispatch(&fake_context, 8, 4, 1);
+  present(&fake_swapchain, 1, 0);                   /* frame ends */
+  assert(frame_state == FRAME_IDLE && !frame_file && frames_logged == 1);
+  present(&fake_swapchain, 1, 0);
+  assert(frame_state == FRAME_IDLE && frames_logged == 1 && presents == 5 && fake_frame_calls == 3);
+  assert(texture_refs == 0);                        /* every GetResource was released */
+
+  snprintf(path, sizeof(path), "%s\\frames\\frame-*.tsv", dir);
+  h = FindFirstFileA(path, &found);
+  assert(h != INVALID_HANDLE_VALUE);
+  FindClose(h);
+  snprintf(path, sizeof(path), "%s\\frames\\%s", dir, found.cFileName);
+  f = fopen(path, "r");
+  const char *expected[] = {
+      "# One frame",
+      "0\tFrameStart\t",
+      "1\tOMSetRenderTargets\tcount=1\trt0=tex2d:",
+      "2\tClearRenderTargetView\ttex2d:",
+      "3\tDrawIndexed\tcount=36 start=0 base=0\ttopology=4\t",
+      "4\tDispatch\tgroups=8,4,1\tcs=none",
+      "5\tPresent",
+  };
+  for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+    assert(fgets(line, sizeof(line), f));
+    assert(!strncmp(line, expected[i], strlen(expected[i])));
+    if (i == 2)
+      assert(strstr(line, ":1920x1080:format=10:mips=1:array=1:samples=1") && strstr(line, "\tdepth=tex2d:"));
+    if (i == 4) {
+      char vs_short[17], ps_short[17], expect_ids[64];
+      memcpy(vs_short, vs_hex, 16), vs_short[16] = 0;
+      memcpy(ps_short, ps_hex, 16), ps_short[16] = 0;
+      snprintf(expect_ids, sizeof(expect_ids), "\tvs=%s\tgs=none\tps=%s\t", vs_short, ps_short);
+      assert(strstr(line, expect_ids) && strstr(line, "\trt_formats=10\tdsv_format=45"));
+    }
+  }
+  assert(!fgets(line, sizeof(line), f));
+  fclose(f);
 
   printf("shader capture test passed: %s\n", dir);
   return 0;

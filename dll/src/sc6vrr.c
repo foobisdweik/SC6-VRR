@@ -23,7 +23,8 @@
  *   SC6VRR_UNCAP=1, SC6VRR_MAX_FPS=120, SC6VRR_GATE=1, SC6VRR_LOG=<Windows path>
  *   SC6VRR_MEASURE=1 records completed battle work and elapsed function times.
  *   SC6VRR_SHADER_DIR=<Windows path> records every shader the game creates,
- *   its input layouts, and the shader combinations that its draws use.
+ *   its input layouts, and the shader combinations that its draws use. With
+ *   it, F10 in the game also logs one frame's calls to <dir>\frames\.
  *   SC6VRR_FRAME_MODS=1 is required for every engine hook above (uncap, gate,
  *   measure). Without it, the DLL changes no frame timing.
  */
@@ -851,6 +852,8 @@ static int shader_capture_open(const char *dir) {
   CreateDirectoryA(path, NULL);
   snprintf(path, sizeof(path), "%s\\blend", shader_dir);
   CreateDirectoryA(path, NULL);
+  snprintf(path, sizeof(path), "%s\\frames", shader_dir);
+  CreateDirectoryA(path, NULL);
   GetLocalTime(&t);
   snprintf(path, sizeof(path), "%s\\bindings-%04d%02d%02d-%02d%02d%02d-%lu.tsv", shader_dir, t.wYear,
            t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, GetCurrentProcessId());
@@ -1140,6 +1143,150 @@ static void note_draw(void) {
   LeaveCriticalSection(&binding_lock);
 }
 
+/* ---------- one-frame log (F10) ------------------------------------------ */
+
+/* F10 arms the log at a Present. The log then covers the next full frame, from
+ * that Present to the following one, in call order: target and resource
+ * bindings, clears, viewports, copies, dispatches, and each draw with its
+ * pipeline state. DXMT's Metal capture (MTL_CAPTURE_ENABLED=1) reacts to the
+ * same key and also captures the next frame, so both describe the same frame
+ * or adjacent ones. Each hook checks frame_state before it does any logging
+ * work. The immediate context is single-threaded, so the log needs no lock. */
+enum { FRAME_IDLE, FRAME_ARMED, FRAME_LOGGING };
+static volatile LONG frame_state;
+static FILE *frame_file;
+static uint64_t frame_calls, frames_logged;
+static int frame_key_was_down;
+static uint32_t bound_cs;
+
+static int real_frame_key_down(void) { return (GetAsyncKeyState(VK_F10) & 0x8000) != 0; }
+static int (*frame_key_down)(void) = real_frame_key_down; /* the test replaces it */
+
+typedef ULONG(WINAPI *com_release_fn)(void *object);
+typedef void(WINAPI *get_resource_fn)(void *view, void **resource);
+typedef void(WINAPI *get_type_fn)(void *resource, D3D11_RESOURCE_DIMENSION *type);
+typedef void(WINAPI *texture2d_desc_fn)(void *texture, D3D11_TEXTURE2D_DESC *desc);
+typedef void(WINAPI *buffer_desc_fn)(void *buffer, D3D11_BUFFER_DESC *desc);
+/* The method pointer of a COM object, by interface and method name. */
+#define VTBL_METHOD(object, iface, method) \
+  ((*(void ***)(object))[offsetof(iface##Vtbl, method) / sizeof(void *)])
+
+static void frame_line(const char *fmt, ...) {
+  if (!frame_file)
+    return;
+  fprintf(frame_file, "%llu\t", (unsigned long long)frame_calls++);
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(frame_file, fmt, ap);
+  va_end(ap);
+  fputc('\n', frame_file);
+}
+
+/* The resource address identifies a texture across the frame, so the log shows
+ * which pass writes a texture and which later pass reads it. */
+static void describe_resource(void *resource, char *out, size_t size) {
+  if (!resource) {
+    snprintf(out, size, "none");
+    return;
+  }
+  D3D11_RESOURCE_DIMENSION type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+  ((get_type_fn)VTBL_METHOD(resource, ID3D11Resource, GetType))(resource, &type);
+  if (type == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+    D3D11_TEXTURE2D_DESC d;
+    ((texture2d_desc_fn)VTBL_METHOD(resource, ID3D11Texture2D, GetDesc))(resource, &d);
+    snprintf(out, size, "tex2d:%p:%ux%u:format=%u:mips=%u:array=%u:samples=%u", resource, d.Width, d.Height,
+             (unsigned)d.Format, d.MipLevels, d.ArraySize, d.SampleDesc.Count);
+  } else if (type == D3D11_RESOURCE_DIMENSION_BUFFER) {
+    D3D11_BUFFER_DESC d;
+    ((buffer_desc_fn)VTBL_METHOD(resource, ID3D11Buffer, GetDesc))(resource, &d);
+    snprintf(out, size, "buffer:%p:%u", resource, d.ByteWidth);
+  } else {
+    snprintf(out, size, "resource%d:%p", (int)type, resource);
+  }
+}
+
+/* GetResource adds a reference, so release it after describing. */
+static void describe_view(void *view, char *out, size_t size) {
+  void *resource = NULL;
+  if (!view) {
+    snprintf(out, size, "none");
+    return;
+  }
+  ((get_resource_fn)VTBL_METHOD(view, ID3D11View, GetResource))(view, &resource);
+  describe_resource(resource, out, size);
+  if (resource)
+    ((com_release_fn)VTBL_METHOD(resource, ID3D11Resource, Release))(resource);
+}
+
+static void describe_views(const char *call, UINT start, UINT count, void *const *views) {
+  char line[4096], one[160];
+  size_t used = (size_t)snprintf(line, sizeof(line), "%s\tstart=%u\tcount=%u", call, start, count);
+  for (UINT i = 0; views && i < count && used < sizeof(line); i++) {
+    describe_view(views[i], one, sizeof(one));
+    used += (size_t)snprintf(line + used, sizeof(line) - used, "\t%u=%s", start + i, one);
+  }
+  frame_line("%s", line);
+}
+
+/* Content IDs are written as the first 16 hex digits of their SHA-256, which is
+ * enough to join with the bindings and shader files. */
+static void short_id(uint32_t id, char out[65]) {
+  id_hex(id, out);
+  if (strlen(out) > 16)
+    out[16] = 0;
+}
+
+static void frame_draw(const char *kind, const char *args) {
+  char layout[65], vs[65], gs[65], ps[65], blend[65], rts[128];
+  short_id(bound.layout, layout);
+  short_id(bound.vs, vs);
+  short_id(bound.gs, gs);
+  short_id(bound.ps, ps);
+  short_id(bound.blend, blend);
+  join_uints(rts, sizeof(rts), bound.rt_formats, bound.rt_count, 0xFF, 0);
+  frame_line("%s\t%s\ttopology=%u\tlayout=%s\tvs=%s\tgs=%s\tps=%s\tblend=%s\trt_formats=%s\tdsv_format=%u", kind,
+             args, bound.topology, layout, vs, gs, ps, blend, rts, bound.dsv_format);
+}
+
+#define FRAME_LOGGING_NOW (frame_state == FRAME_LOGGING)
+
+/* Called at every Present, before the real one. */
+static void frame_present(void) {
+  int down = frame_key_down();
+  int pressed = down && !frame_key_was_down;
+  frame_key_was_down = down;
+  if (frame_state == FRAME_IDLE) {
+    if (pressed)
+      frame_state = FRAME_ARMED;
+  } else if (frame_state == FRAME_ARMED) {
+    char path[MAX_PATH + 96];
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    snprintf(path, sizeof(path), "%s\\frames\\frame-%04d%02d%02d-%02d%02d%02d-%llu.tsv", shader_dir, t.wYear,
+             t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, (unsigned long long)frames_logged);
+    frame_file = fopen(path, "w");
+    frame_calls = 0;
+    if (frame_file) {
+      char rts[128];
+      join_uints(rts, sizeof(rts), bound.rt_formats, bound.rt_count, 0xFF, 0);
+      fprintf(frame_file, "# One frame from Present to Present. Pointers identify resources within this frame.\n");
+      frame_line("FrameStart\trt_formats=%s\tdsv_format=%u", rts, bound.dsv_format);
+      frame_state = FRAME_LOGGING;
+      log_msg("frames: logging one frame to %s", path);
+    } else {
+      frame_state = FRAME_IDLE;
+      log_msg("frames: could not open %s", path);
+    }
+  } else {
+    frame_line("Present");
+    fclose(frame_file);
+    frame_file = NULL;
+    frames_logged++;
+    frame_state = FRAME_IDLE;
+    log_msg("frames: frame log %llu written", (unsigned long long)frames_logged);
+  }
+}
+
 typedef void(WINAPI *set_shader_fn)(void *ctx, void *shader, void *const *instances, UINT count);
 typedef void(WINAPI *set_layout_fn)(void *ctx, void *layout);
 typedef void(WINAPI *set_topology_fn)(void *ctx, UINT topology);
@@ -1162,7 +1309,9 @@ typedef void(WINAPI *dsv_desc_fn)(void *view, D3D11_DEPTH_STENCIL_VIEW_DESC *des
 enum {
   CTX_VS_SET, CTX_GS_SET, CTX_PS_SET, CTX_LAYOUT, CTX_TOPOLOGY, CTX_VERTEX_BUFFERS, CTX_TARGETS,
   CTX_TARGETS_UAVS, CTX_BLEND, CTX_DRAW, CTX_DRAW_INDEXED, CTX_DRAW_INDEXED_INSTANCED, CTX_DRAW_INSTANCED,
-  CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_COUNT
+  CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_CS_SET, CTX_PS_SRV, CTX_CS_SRV,
+  CTX_CS_UAV, CTX_CLEAR_RTV, CTX_CLEAR_DSV, CTX_VIEWPORTS, CTX_DISPATCH, CTX_DISPATCH_INDIRECT, CTX_COPY_RESOURCE,
+  CTX_COPY_REGION, CTX_RESOLVE, CTX_COUNT
 };
 static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(VSSetShader), CONTEXT_SLOT(GSSetShader), CONTEXT_SLOT(PSSetShader),
@@ -1170,12 +1319,18 @@ static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(OMSetRenderTargets), CONTEXT_SLOT(OMSetRenderTargetsAndUnorderedAccessViews),
     CONTEXT_SLOT(OMSetBlendState), CONTEXT_SLOT(Draw), CONTEXT_SLOT(DrawIndexed),
     CONTEXT_SLOT(DrawIndexedInstanced), CONTEXT_SLOT(DrawInstanced), CONTEXT_SLOT(DrawAuto),
-    CONTEXT_SLOT(DrawIndexedInstancedIndirect), CONTEXT_SLOT(DrawInstancedIndirect)};
+    CONTEXT_SLOT(DrawIndexedInstancedIndirect), CONTEXT_SLOT(DrawInstancedIndirect), CONTEXT_SLOT(CSSetShader),
+    CONTEXT_SLOT(PSSetShaderResources), CONTEXT_SLOT(CSSetShaderResources), CONTEXT_SLOT(CSSetUnorderedAccessViews),
+    CONTEXT_SLOT(ClearRenderTargetView), CONTEXT_SLOT(ClearDepthStencilView), CONTEXT_SLOT(RSSetViewports),
+    CONTEXT_SLOT(Dispatch), CONTEXT_SLOT(DispatchIndirect), CONTEXT_SLOT(CopyResource),
+    CONTEXT_SLOT(CopySubresourceRegion), CONTEXT_SLOT(ResolveSubresource)};
 static const char *const kContextNames[CTX_COUNT] = {
     "VSSetShader", "GSSetShader", "PSSetShader", "IASetInputLayout", "IASetPrimitiveTopology",
     "IASetVertexBuffers", "OMSetRenderTargets", "OMSetRenderTargetsAndUnorderedAccessViews", "OMSetBlendState",
     "Draw", "DrawIndexed", "DrawIndexedInstanced", "DrawInstanced", "DrawAuto", "DrawIndexedInstancedIndirect",
-    "DrawInstancedIndirect"};
+    "DrawInstancedIndirect", "CSSetShader", "PSSetShaderResources", "CSSetShaderResources",
+    "CSSetUnorderedAccessViews", "ClearRenderTargetView", "ClearDepthStencilView", "RSSetViewports", "Dispatch",
+    "DispatchIndirect", "CopyResource", "CopySubresourceRegion", "ResolveSubresource"};
 static void *orig_context[CTX_COUNT];
 
 /* Reads the formats of the bound views. A view's format can differ from its
@@ -1233,14 +1388,34 @@ static void WINAPI hook_vertex_buffers_set(void *ctx, UINT start, UINT count, vo
     bound_strides[start + i] = buffers && buffers[i] && strides ? strides[i] : 0;
   ((set_vertex_buffers_fn)orig_context[CTX_VERTEX_BUFFERS])(ctx, start, count, buffers, strides, offsets);
 }
+static void log_targets(const char *call, UINT count, void *const *rtvs, void *dsv) {
+  char line[2048], one[160];
+  size_t used = (size_t)snprintf(line, sizeof(line), "%s\tcount=%u", call, count);
+  for (UINT i = 0; rtvs && i < count && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && used < sizeof(line); i++) {
+    describe_view(rtvs[i], one, sizeof(one));
+    used += (size_t)snprintf(line + used, sizeof(line) - used, "\trt%u=%s", i, one);
+  }
+  describe_view(dsv, one, sizeof(one));
+  if (used < sizeof(line))
+    snprintf(line + used, sizeof(line) - used, "\tdepth=%s", one);
+  frame_line("%s", line);
+}
+
 static void WINAPI hook_targets_set(void *ctx, UINT count, void *const *rtvs, void *dsv) {
   note_targets(count, rtvs, dsv);
+  if (FRAME_LOGGING_NOW)
+    log_targets("OMSetRenderTargets", count, rtvs, dsv);
   ((set_targets_fn)orig_context[CTX_TARGETS])(ctx, count, rtvs, dsv);
 }
 static void WINAPI hook_targets_uavs_set(void *ctx, UINT count, void *const *rtvs, void *dsv, UINT uav_start,
                                          UINT uav_count, void *const *uavs, const UINT *initial_counts) {
-  if (count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+  if (count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
     note_targets(count, rtvs, dsv);
+    if (FRAME_LOGGING_NOW)
+      log_targets("OMSetRenderTargetsAndUnorderedAccessViews", count, rtvs, dsv);
+  }
+  if (FRAME_LOGGING_NOW && uav_count != D3D11_KEEP_UNORDERED_ACCESS_VIEWS)
+    describe_views("OMSetUnorderedAccessViews", uav_start, uav_count, uavs);
   ((set_targets_uavs_fn)orig_context[CTX_TARGETS_UAVS])(ctx, count, rtvs, dsv, uav_start, uav_count, uavs,
                                                         initial_counts);
 }
@@ -1250,33 +1425,168 @@ static void WINAPI hook_blend_set(void *ctx, void *state, const FLOAT factor[4],
 }
 static void WINAPI hook_draw(void *ctx, UINT count, UINT start) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "count=%u start=%u", count, start);
+    frame_draw("Draw", args);
+  }
   ((draw_fn)orig_context[CTX_DRAW])(ctx, count, start);
 }
 static void WINAPI hook_draw_indexed(void *ctx, UINT count, UINT start, INT base) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "count=%u start=%u base=%d", count, start, base);
+    frame_draw("DrawIndexed", args);
+  }
   ((draw_indexed_fn)orig_context[CTX_DRAW_INDEXED])(ctx, count, start, base);
 }
 static void WINAPI hook_draw_indexed_instanced(void *ctx, UINT count, UINT instances, UINT start, INT base,
                                                UINT start_instance) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "count=%u instances=%u start=%u base=%d", count, instances, start, base);
+    frame_draw("DrawIndexedInstanced", args);
+  }
   ((draw_indexed_instanced_fn)orig_context[CTX_DRAW_INDEXED_INSTANCED])(ctx, count, instances, start, base,
                                                                         start_instance);
 }
 static void WINAPI hook_draw_instanced(void *ctx, UINT count, UINT instances, UINT start, UINT start_instance) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "count=%u instances=%u start=%u", count, instances, start);
+    frame_draw("DrawInstanced", args);
+  }
   ((draw_instanced_fn)orig_context[CTX_DRAW_INSTANCED])(ctx, count, instances, start, start_instance);
 }
 static void WINAPI hook_draw_auto(void *ctx) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "-");
+    frame_draw("DrawAuto", args);
+  }
   ((draw_auto_fn)orig_context[CTX_DRAW_AUTO])(ctx);
 }
 static void WINAPI hook_draw_indexed_indirect(void *ctx, void *args, UINT offset) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "offset=%u", offset);
+    frame_draw("DrawIndexedInstancedIndirect", args);
+  }
   ((draw_indirect_fn)orig_context[CTX_DRAW_INDEXED_INDIRECT])(ctx, args, offset);
 }
 static void WINAPI hook_draw_instanced_indirect(void *ctx, void *args, UINT offset) {
   note_draw();
+  if (FRAME_LOGGING_NOW) {
+    char args[96];
+    snprintf(args, sizeof(args), "offset=%u", offset);
+    frame_draw("DrawInstancedIndirect", args);
+  }
   ((draw_indirect_fn)orig_context[CTX_DRAW_INSTANCED_INDIRECT])(ctx, args, offset);
+}
+
+
+/* Calls that only the frame log needs. They pass straight through when no
+ * frame is being logged, except CSSetShader, which tracks the compute shader. */
+typedef void(WINAPI *set_views_fn)(void *ctx, UINT start, UINT count, void *const *views);
+typedef void(WINAPI *set_uavs_fn)(void *ctx, UINT start, UINT count, void *const *uavs, const UINT *counts);
+typedef void(WINAPI *clear_rtv_fn)(void *ctx, void *rtv, const FLOAT color[4]);
+typedef void(WINAPI *clear_dsv_fn)(void *ctx, void *dsv, UINT flags, FLOAT depth, UINT8 stencil);
+typedef void(WINAPI *set_viewports_fn)(void *ctx, UINT count, const D3D11_VIEWPORT *viewports);
+typedef void(WINAPI *dispatch_fn)(void *ctx, UINT x, UINT y, UINT z);
+typedef void(WINAPI *copy_resource_fn)(void *ctx, void *dst, void *src);
+typedef void(WINAPI *copy_region_fn)(void *ctx, void *dst, UINT dst_sub, UINT x, UINT y, UINT z, void *src,
+                                     UINT src_sub, const D3D11_BOX *box);
+typedef void(WINAPI *resolve_fn)(void *ctx, void *dst, UINT dst_sub, void *src, UINT src_sub, DXGI_FORMAT format);
+
+static void WINAPI hook_cs_set(void *ctx, void *shader, void *const *instances, UINT count) {
+  bound_cs = object_lookup(shader, NULL);
+  ((set_shader_fn)orig_context[CTX_CS_SET])(ctx, shader, instances, count);
+}
+static void WINAPI hook_ps_srv_set(void *ctx, UINT start, UINT count, void *const *views) {
+  if (FRAME_LOGGING_NOW)
+    describe_views("PSSetShaderResources", start, count, views);
+  ((set_views_fn)orig_context[CTX_PS_SRV])(ctx, start, count, views);
+}
+static void WINAPI hook_cs_srv_set(void *ctx, UINT start, UINT count, void *const *views) {
+  if (FRAME_LOGGING_NOW)
+    describe_views("CSSetShaderResources", start, count, views);
+  ((set_views_fn)orig_context[CTX_CS_SRV])(ctx, start, count, views);
+}
+static void WINAPI hook_cs_uav_set(void *ctx, UINT start, UINT count, void *const *uavs, const UINT *counts) {
+  if (FRAME_LOGGING_NOW)
+    describe_views("CSSetUnorderedAccessViews", start, count, uavs);
+  ((set_uavs_fn)orig_context[CTX_CS_UAV])(ctx, start, count, uavs, counts);
+}
+static void WINAPI hook_clear_rtv(void *ctx, void *rtv, const FLOAT color[4]) {
+  if (FRAME_LOGGING_NOW) {
+    char view[160];
+    describe_view(rtv, view, sizeof(view));
+    frame_line("ClearRenderTargetView\t%s\tcolor=%g,%g,%g,%g", view, color[0], color[1], color[2], color[3]);
+  }
+  ((clear_rtv_fn)orig_context[CTX_CLEAR_RTV])(ctx, rtv, color);
+}
+static void WINAPI hook_clear_dsv(void *ctx, void *dsv, UINT flags, FLOAT depth, UINT8 stencil) {
+  if (FRAME_LOGGING_NOW) {
+    char view[160];
+    describe_view(dsv, view, sizeof(view));
+    frame_line("ClearDepthStencilView\t%s\tflags=%u\tdepth=%g\tstencil=%u", view, flags, depth, stencil);
+  }
+  ((clear_dsv_fn)orig_context[CTX_CLEAR_DSV])(ctx, dsv, flags, depth, stencil);
+}
+static void WINAPI hook_viewports_set(void *ctx, UINT count, const D3D11_VIEWPORT *v) {
+  if (FRAME_LOGGING_NOW && count && v)
+    frame_line("RSSetViewports\tcount=%u\t0=%g,%g,%gx%g,depth=%g-%g", count, v[0].TopLeftX, v[0].TopLeftY, v[0].Width,
+               v[0].Height, v[0].MinDepth, v[0].MaxDepth);
+  ((set_viewports_fn)orig_context[CTX_VIEWPORTS])(ctx, count, v);
+}
+static void WINAPI hook_dispatch(void *ctx, UINT x, UINT y, UINT z) {
+  if (FRAME_LOGGING_NOW) {
+    char cs[65];
+    short_id(bound_cs, cs);
+    frame_line("Dispatch\tgroups=%u,%u,%u\tcs=%s", x, y, z, cs);
+  }
+  ((dispatch_fn)orig_context[CTX_DISPATCH])(ctx, x, y, z);
+}
+static void WINAPI hook_dispatch_indirect(void *ctx, void *args, UINT offset) {
+  if (FRAME_LOGGING_NOW) {
+    char cs[65];
+    short_id(bound_cs, cs);
+    frame_line("DispatchIndirect\toffset=%u\tcs=%s", offset, cs);
+  }
+  ((draw_indirect_fn)orig_context[CTX_DISPATCH_INDIRECT])(ctx, args, offset);
+}
+static void WINAPI hook_copy_resource(void *ctx, void *dst, void *src) {
+  if (FRAME_LOGGING_NOW) {
+    char d[160], s[160];
+    describe_resource(dst, d, sizeof(d));
+    describe_resource(src, s, sizeof(s));
+    frame_line("CopyResource\tdst=%s\tsrc=%s", d, s);
+  }
+  ((copy_resource_fn)orig_context[CTX_COPY_RESOURCE])(ctx, dst, src);
+}
+static void WINAPI hook_copy_region(void *ctx, void *dst, UINT dst_sub, UINT x, UINT y, UINT z, void *src,
+                                    UINT src_sub, const D3D11_BOX *box) {
+  if (FRAME_LOGGING_NOW) {
+    char d[160], s[160];
+    describe_resource(dst, d, sizeof(d));
+    describe_resource(src, s, sizeof(s));
+    frame_line("CopySubresourceRegion\tdst=%s\tdst_sub=%u\tsrc=%s\tsrc_sub=%u", d, dst_sub, s, src_sub);
+  }
+  ((copy_region_fn)orig_context[CTX_COPY_REGION])(ctx, dst, dst_sub, x, y, z, src, src_sub, box);
+}
+static void WINAPI hook_resolve(void *ctx, void *dst, UINT dst_sub, void *src, UINT src_sub, DXGI_FORMAT format) {
+  if (FRAME_LOGGING_NOW) {
+    char d[160], s[160];
+    describe_resource(dst, d, sizeof(d));
+    describe_resource(src, s, sizeof(s));
+    frame_line("ResolveSubresource\tdst=%s\tsrc=%s\tformat=%u", d, s, (unsigned)format);
+  }
+  ((resolve_fn)orig_context[CTX_RESOLVE])(ctx, dst, dst_sub, src, src_sub, format);
 }
 
 /* Replaces vtable pointers instead of patching the methods' code. Under
@@ -1304,6 +1614,83 @@ static int swap_vtable_slots(void **vtable, const int *slots, void *const *hooks
   }
   VirtualProtect(&vtable[low], (SIZE_T)(high - low + 1) * sizeof(void *), old, &old);
   return 1;
+}
+
+/* The frame log needs the end of each frame, which is IDXGISwapChain::Present.
+ * The exe imports CreateDXGIFactory and CreateDXGIFactory1 from dxgi.dll, so
+ * those exports are hooked like the d3d11 ones. The factory's CreateSwapChain
+ * and the swap chain's Present are then hooked through their vtables. */
+_Static_assert(offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *) == 10, "unexpected IDXGIFactory layout");
+_Static_assert(offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *) == 8, "unexpected IDXGISwapChain layout");
+
+typedef HRESULT(WINAPI *create_factory_fn)(REFIID riid, void **factory);
+typedef HRESULT(WINAPI *create_swapchain_fn)(void *factory, void *device, DXGI_SWAP_CHAIN_DESC *desc,
+                                             void **swapchain);
+typedef HRESULT(WINAPI *present_fn)(void *swapchain, UINT sync_interval, UINT flags);
+static create_factory_fn orig_create_factory, orig_create_factory1;
+static create_swapchain_fn orig_create_swapchain;
+static present_fn orig_present;
+static volatile LONG factory_hooked, present_hooked;
+
+static HRESULT WINAPI hook_present(void *swapchain, UINT sync_interval, UINT flags) {
+  frame_present();
+  return orig_present(swapchain, sync_interval, flags);
+}
+
+static void hook_swapchain(void *swapchain) {
+  if (!swapchain || InterlockedCompareExchange(&present_hooked, 1, 0))
+    return;
+  static const int slots[1] = {offsetof(IDXGISwapChainVtbl, Present) / sizeof(void *)};
+  static const char *const names[1] = {"Present"};
+  void *hooks[1] = {hook_present}, *originals[1];
+  if (swap_vtable_slots(*(void ***)swapchain, slots, hooks, originals, 1, names))
+    orig_present = (present_fn)originals[0];
+}
+
+static HRESULT WINAPI hook_create_swapchain(void *factory, void *device, DXGI_SWAP_CHAIN_DESC *desc,
+                                            void **swapchain) {
+  HRESULT hr = orig_create_swapchain(factory, device, desc, swapchain);
+  if (SUCCEEDED(hr) && swapchain)
+    hook_swapchain(*swapchain);
+  return hr;
+}
+
+static void hook_factory(void *factory) {
+  if (!factory || InterlockedCompareExchange(&factory_hooked, 1, 0))
+    return;
+  static const int slots[1] = {offsetof(IDXGIFactoryVtbl, CreateSwapChain) / sizeof(void *)};
+  static const char *const names[1] = {"CreateSwapChain"};
+  void *hooks[1] = {hook_create_swapchain}, *originals[1];
+  if (swap_vtable_slots(*(void ***)factory, slots, hooks, originals, 1, names))
+    orig_create_swapchain = (create_swapchain_fn)originals[0];
+}
+
+static HRESULT WINAPI hook_create_factory(REFIID riid, void **factory) {
+  HRESULT hr = orig_create_factory(riid, factory);
+  if (SUCCEEDED(hr) && factory)
+    hook_factory(*factory);
+  return hr;
+}
+
+static HRESULT WINAPI hook_create_factory1(REFIID riid, void **factory) {
+  HRESULT hr = orig_create_factory1(riid, factory);
+  if (SUCCEEDED(hr) && factory)
+    hook_factory(*factory);
+  return hr;
+}
+
+/* Takes the two export addresses as arguments so that the test can pass fakes. */
+static int install_frame_log(void *create_factory, void *create_factory1) {
+  int hooked = 0;
+  if (create_factory && MH_CreateHook(create_factory, hook_create_factory, (void **)&orig_create_factory) == MH_OK &&
+      MH_EnableHook(create_factory) == MH_OK)
+    hooked++;
+  if (create_factory1 &&
+      MH_CreateHook(create_factory1, hook_create_factory1, (void **)&orig_create_factory1) == MH_OK &&
+      MH_EnableHook(create_factory1) == MH_OK)
+    hooked++;
+  log_msg("frames: %d factory creation hooks installed; press F10 in the game to log one frame", hooked);
+  return hooked > 0;
 }
 
 typedef void(WINAPI *get_context_fn)(void *device, void **context);
@@ -1352,7 +1739,10 @@ static void install_device_shader_hooks(void *device) {
       hook_vs_set,      hook_gs_set,         hook_ps_set,       hook_layout_set,
       hook_topology_set, hook_vertex_buffers_set, hook_targets_set, hook_targets_uavs_set,
       hook_blend_set,   hook_draw,           hook_draw_indexed, hook_draw_indexed_instanced,
-      hook_draw_instanced, hook_draw_auto,   hook_draw_indexed_indirect, hook_draw_instanced_indirect};
+      hook_draw_instanced, hook_draw_auto,   hook_draw_indexed_indirect, hook_draw_instanced_indirect,
+      hook_cs_set,      hook_ps_srv_set,     hook_cs_srv_set,   hook_cs_uav_set,
+      hook_clear_rtv,   hook_clear_dsv,      hook_viewports_set, hook_dispatch,
+      hook_dispatch_indirect, hook_copy_resource, hook_copy_region, hook_resolve};
   swap_vtable_slots(context_vtable, kContextSlots, context_hooks, orig_context, CTX_COUNT, kContextNames);
   ((release_fn)context_vtable[2])(context);
 }
@@ -1385,6 +1775,8 @@ static HRESULT WINAPI hook_create_device_swapchain(void *adapter, int driver_typ
                                             sdk_version, desc, swapchain, device, level, context);
   if (SUCCEEDED(hr) && device && *device)
     install_device_shader_hooks(*device);
+  if (SUCCEEDED(hr) && swapchain)
+    hook_swapchain(*swapchain);
   return hr;
 }
 
@@ -1430,11 +1822,15 @@ static void setup(void) {
   char dir[MAX_PATH];
   DWORD dir_len = GetEnvironmentVariableA("SC6VRR_SHADER_DIR", dir, sizeof(dir));
   if (dir_len && dir_len < sizeof(dir)) {
-    HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
+    HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll"), dxgi = NULL;
     if (!d3d11 || !shader_capture_open(dir) ||
         !install_shader_capture((void *)GetProcAddress(d3d11, "D3D11CreateDevice"),
                                 (void *)GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain")))
       log_msg("shaders: capture disabled (d3d11 %p, directory %s)", (void *)d3d11, dir);
+    else if (!(dxgi = GetModuleHandleW(L"dxgi.dll")) ||
+             !install_frame_log((void *)GetProcAddress(dxgi, "CreateDXGIFactory"),
+                                (void *)GetProcAddress(dxgi, "CreateDXGIFactory1")))
+      log_msg("frames: frame log disabled (dxgi %p)", (void *)dxgi);
   }
   /* Frame-rate changes are switched off for now (2026-10-16). The engine hooks
    * below go in only with SC6VRR_FRAME_MODS=1, whatever the other settings say. */
