@@ -2,8 +2,10 @@
 
 ## Recommended launcher (2026-10-17, later)
 
-Run `tools/gamemode/build-ls-app.sh` once, then `tools/gamemode/launch-ls-app.sh`.
+Run `tools/gamemode/build-ls-app.sh` once. Then double-click `~/Applications/SC6-VRR/SoulCalibur VI.app`.
 macOS then turns on real Game Mode for SC6 by itself, with the menu bar indicator.
+This final app keeps the presentation fixes, keeps stock frame timing, and writes no logs. The Metal HUD is off.
+See [Final app bundle](#final-app-bundle-2026-10-17).
 Quit FineTune and BetterDisplay before playing, or presentation is `Composited`.
 See [Game Mode works through the bundle](#game-mode-works-through-the-bundle-2026-10-17).
 
@@ -206,7 +208,7 @@ That mark turned out to be a result of detection, not its cause (see below).
 ## Game Mode works through the bundle (2026-10-17)
 
 Status: verified. The user saw the Game Mode indicator and `Direct` presentation at the same time.
-Launch with `tools/gamemode/launch-ls-app.sh` after `tools/gamemode/build-ls-app.sh`.
+This section describes the test bundle. The final form is in [Final app bundle](#final-app-bundle-2026-10-17).
 
 How macOS detects a game, from the `gamepolicyd` and `GamePolicyAgent` logs of a DuckStation session and the SC6 sessions:
 
@@ -219,7 +221,7 @@ The bundle form that works:
 
 - `CFBundleExecutable` is a copy of CrossOver Preview's x86-64 Wine loader. The loader runs `SoulcaliburVI.exe` in the same process, without `winewrapper.exe`.
 - `Contents/MacOS/ntdll.so` is a symlink to CrossOver's `ntdll.so`, because the loader loads it from its own folder.
-- `LSEnvironment` in Info.plist holds CrossOver's Wine environment and this project's settings. `launch-ls-app.sh` passes the game path with `open --args`.
+- `LSEnvironment` in Info.plist holds CrossOver's Wine environment and this project's settings. The game path is passed with `open --args`.
 - The whole bundle is signed ad hoc, and the loader keeps its hardened runtime flag and entitlements. Without a bundle signature, LaunchServices refused the launch: `Launch requires secure launch with spawn constraints, but none are present or valid` (error -54).
 - The builder refuses to run while SC6 runs. The launcher refuses to start if CrossOver's loader changed since the build.
 
@@ -234,3 +236,27 @@ Remaining limits:
 - In the bundle runs, switching away from the game sometimes made it leave native fullscreen (DXMT state `5 -> 3`, `NotCoveringScreen`). The window then stays 1728×1084, DXMT does not request fullscreen again, and the game is composited until it restarts. This was not seen with CrossOver's launcher. The cause is unknown.
 - The bundle runs only the game. Steam and other Windows programs still use CrossOver's launcher.
 - Battle performance with this launch path is unmeasured.
+
+## Final app bundle (2026-10-17)
+
+`tools/gamemode/build-ls-app.sh` builds `~/Applications/SC6-VRR/SoulCalibur VI.app`. Double-click it to play.
+
+Two bundles are needed, because a double-click passes no arguments:
+
+1. The outer app is a launcher with no Dock icon (`LSUIElement`). It checks the SHA-256 hashes of CrossOver's Wine loader and Preview's seven x86-64 DXMT files against the values from build time. Then it opens the inner app with the game's path and exits. It shows an alert instead if the game already runs or a hash differs.
+2. The inner app, `Contents/Helpers/SoulCalibur VI Game.app`, is the game bundle described above. Its executable is the Wine loader copy.
+
+Settings in the inner app's `LSEnvironment`:
+
+- Presentation: the private DXMT build, `dxgi.nativeFullscreen=True`, `dxgi.metalLayerPixelFormat=bgr10a2`, MetalFX off, no pipeline archive. These come from `launch-env.sh`.
+- Frame timing: stock. `WINEDLLOVERRIDES` includes `dinput8=b`, so Wine uses its built-in `dinput8` and the SC6-VRR DLL in the game folder does not load. That DLL always writes `sc6vrr.log`, and it does nothing else with frame changes and capture off. The DLL file stays installed for test launches.
+- Logging: `WINEDEBUG=-all`, `DXMT_LOG_LEVEL=none`, `DXMT_LOG_PATH=none`, `DXMT_DUMP_LAYERS=0`, `MTL_HUD_ENABLED=0`. LaunchServices sends the app's output to nowhere.
+
+Checked on 2026-10-17 with `open` on the outer app:
+
+- `gamepolicyd` logged `Found game` and then `Game mode enabled.` with the policy on automatic.
+- `lsof` showed Wine's built-in `dinput8.dll` and Preview's DXMT files in the game process. The game folder's `dinput8.dll` was not open.
+- No file changed in the game folder, and no `.log` file changed in the bottle, during the first 30 seconds.
+
+Direct presentation was not rechecked with this build, because the HUD is off. Its presentation settings match the run in which the user saw `Direct`.
+Quit FineTune and BetterDisplay before playing.
