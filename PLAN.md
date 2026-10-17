@@ -1,6 +1,38 @@
 # SC6-VRR plan
 
-Goal: SoulCalibur VI renders at up to 120 fps on the MacBook Pro's ProMotion display. The battle logic keeps its 60 Hz timing, and ProMotion pacing is on by default.
+## Current priority (2026-10-16)
+
+The active goal is a native Apple silicon program built in a clean-room shape (decided 2026-10-16):
+
+1. The analysis side studies the original executable and the running game, then writes specifications in its own words.
+2. The implementation side writes new code from those specifications only, in a separate repository.
+3. The shipped program contains only that new code and permissively licensed libraries.
+4. At runtime, the program loads assets from the user's own installation.
+
+The first target is battle logic that matches the original game's behavior and timing.
+HDR, ProMotion, interpolation, and changes to game timing are deferred.
+Metal rendering moved back into scope on 2026-10-16, after the clean-room plan was recorded.
+
+Tests must cover connected battle behavior across recorded sequences for both fighters.
+Cover movement, airborne behavior, attacks, hits, defense, recovery, freeze handling, and resets as the specified sections permit.
+Report unsupported behavior explicitly, and compare the outputs with the original game.
+Increasing the number of isolated function calls does not satisfy this requirement.
+
+The earlier ARM64 reconstructions follow Ghidra's reconstruction of the original code.
+So they are analysis material: they may check the specifications, but they never enter the shipped program.
+The current proof matches 64 actual movement calls, including 11 calls that change position. It is a preliminary analysis result.
+
+Two legal questions block any public release, but not the analysis and implementation work:
+
+- The program must decrypt the user's pak files to load assets. Whether that is lawful circumvention is unsettled.
+- The game's license and the Steam terms have not been checked for reverse-engineering clauses.
+
+See [the active native plan](notes/native-port.md) and [the broader test plan](notes/native-battle-tests.md).
+
+## Earlier VRR design (deferred)
+
+The earlier goal was rendering at up to 120 fps while preserving 60 Hz battle logic and enabling ProMotion pacing.
+The sections below preserve that work. They do not set the current work priority.
 
 ## 1. What we know (verified 2026-10-15)
 
@@ -80,6 +112,9 @@ Not needed: UE4SS (our own small loader has fewer parts), the pak AES key (we re
 ## 4. Steps
 
 1. **Baseline.** Partly done 2026-10-15 on CrossOver 26.3 (`notes/test-results.md`); the CrossOver Preview comparison is still open. Run the game with the Metal HUD on, on CrossOver 26.3 and on CrossOver Preview 27.0 with FEX (see [`notes/dxmt.md`](notes/dxmt.md)). Record the fps, the present interval, and the round timer length in training mode. This gives the stock numbers to compare with.
+   - Measurement tools updated and tested live on 2026-10-15. Test 10 measured 77.1 engine frames/s and 59.52 completed battle advances/s. The battle counter total matched master-clock increments. Most elapsed frame time lies outside `UWorld::Tick`. The CPU or GPU limit remains unverified. See [test 10](notes/test-results.md#test-10-measurement-without-sample).
+   - Cases 11 and 13 completed on 2026-10-16, but their actions differed. The four idle repeats on Kaer Morhen then completed with native exports. DXMT measured 80.077 fps with the detail timers enabled and 80.017 fps with them disabled. This pair shows no clear timer penalty. D3DMetal measured 86.180 and 86.611 fps, but the user reported a black floor in the latter test. Its timer comparison remains inconclusive. Different layer dimensions and presentation prevent attributing the cross-implementation difference solely to translation. See [the idle comparison](notes/idle-comparison.md).
+   - The follow-up identified the reproduced full-core thread as SC6's `RenderThread 2`. Its Windows thread record matched the exact OS counter handle at 99.286% CPU. The game thread used 26.749%, and DXMT's encoding thread used 41.222%. Precise function costs remain unknown because the profiler reconstructed Windows stacks incorrectly. See [the thread identification](notes/thread-identity.md).
 2. **Find the cap.** Done 2026-10-15; see [`notes/frame-cap.md`](notes/frame-cap.md). `DefaultEngine.ini` in the pak sets `bUseFixedFrameRate=True` and `FixedFrameRate=60`.
 3. **Loader DLL.** Done 2026-10-15 (`dll/`, test 07). Build the proxy `dinput8.dll` with the hash check and logging only. This proves that it loads under CrossOver before any hook goes in.
 4. **Cap test.** Done 2026-10-15 (test 07: up to 120 fps, fight too fast). Raise the cap with no gating. The fight should run fast, which confirms the frame-locked model above.
