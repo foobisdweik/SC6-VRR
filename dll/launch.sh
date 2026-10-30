@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Launch SC6 with the private DXMT build, native fullscreen, and Game Mode.
 # Settings come from sc6vrr.ini next to SoulcaliburVI.exe: [launch] here and in
-# dll/apply-ini.sh, [sc6vrr] and [engine] in the DLL itself.
+# dll/apply-ini.sh, [sc6vrr] in the DLL itself.
 # Usage: dll/launch.sh
 set -euo pipefail
 here=${0:A:h}

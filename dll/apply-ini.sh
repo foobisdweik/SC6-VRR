@@ -3,7 +3,7 @@
 # whose C:\Games\SoulCalibur 6 is this game folder (SC6-Rosetta, and SC6-FEX
 # through its symlink), so CrossOver GUI launches use the same settings.
 # It also makes each of those bottles load the sc6vrr dinput8.dll for
-# SoulcaliburVI.exe, because the DLL applies [sc6vrr] and [engine].
+# SoulcaliburVI.exe, because the DLL applies [sc6vrr].
 # dll/launch.sh runs this itself. Run it
 # by hand after editing [launch] when you start the game from CrossOver.
 # CrossOver resets WINELOADER and WINEDLLOVERRIDES, so the Game Mode helper

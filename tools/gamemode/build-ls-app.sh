@@ -28,7 +28,7 @@
 #   ini-env.sh and passes the values to the game bundle with `open --env`.
 #   These keys are therefore left out of LSEnvironment.
 # - The sc6vrr dinput8.dll loads as in every other launch, and it reads
-#   [sc6vrr] and [engine] itself. SC6VRR_LOG=none turns its log off.
+#   [sc6vrr] itself. SC6VRR_LOG=none turns its log off.
 # - Wine output goes to /dev/null. The Game Mode helper is not used, because
 #   macOS turns Game Mode on for this game bundle by itself.
 #

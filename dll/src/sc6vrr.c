@@ -2122,89 +2122,6 @@ static int install_shader_capture(void *create_device, void *create_device_swapc
   return hooked > 0;
 }
 
-/* ---------- Engine.ini --------------------------------------------------- */
-
-/* UE4 reads Engine.ini after this DLL's DllMain, so [engine] ScreenPercentage
- * in sc6vrr.ini is written into Engine.ini's [SystemSettings] here. That makes
- * the setting work for every launch method. 0 leaves Engine.ini unchanged. */
-static void apply_screen_percentage(void) {
-  int pct = ini_path[0] ? (int)GetPrivateProfileIntA("engine", "ScreenPercentage", 0, ini_path) : 0;
-  if (pct <= 0)
-    return;
-  static const char tail[] = "\\SoulcaliburVI\\Saved\\Config\\WindowsNoEditor\\Engine.ini";
-  char path[MAX_PATH], tmp[MAX_PATH + 4], want[48];
-  DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path));
-  if (!n || n + sizeof(tail) > sizeof(path))
-    return;
-  strcat(path, tail);
-  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-  int want_len = snprintf(want, sizeof(want), "r.ScreenPercentage=%d", pct);
-
-  FILE *f = fopen(path, "rb");
-  char *text = NULL;
-  long size = 0;
-  if (f) {
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    text = malloc(size + 1);
-    if (!text || fread(text, 1, size, f) != (size_t)size) {
-      fclose(f);
-      free(text);
-      log_msg("engine: could not read %s", path);
-      return;
-    }
-    fclose(f);
-  } else if (!(text = malloc(1))) {
-    return;
-  }
-  text[size] = 0;
-
-  /* Find an existing "r.ScreenPercentage=" line, else the section header. */
-  char *line = NULL, *header = NULL;
-  for (char *p = text; *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : p + strlen(p)) {
-    if (!line && !_strnicmp(p, "r.ScreenPercentage=", 19))
-      line = p;
-    if (!header && !_strnicmp(p, "[SystemSettings]", 16))
-      header = p;
-  }
-  const char *keep_to, *resume_at, *insert_before = "", *insert_after = "\r\n";
-  if (line) {
-    size_t old_len = strcspn(line, "\r\n");
-    if ((int)old_len == want_len && !memcmp(line, want, want_len)) {
-      free(text);
-      log_msg("engine: %s already set", want);
-      return;
-    }
-    keep_to = line;
-    resume_at = line + old_len;
-    insert_after = "";
-  } else if (header) {
-    char *next = strchr(header, '\n');
-    keep_to = resume_at = next ? next + 1 : header + strlen(header);
-    if (!next)
-      insert_before = "\r\n";
-  } else {
-    keep_to = resume_at = text + size;
-    insert_before = (size && text[size - 1] != '\n') ? "\r\n\r\n[SystemSettings]\r\n" : "\r\n[SystemSettings]\r\n";
-  }
-
-  /* Write a temporary file, then replace Engine.ini in one rename. */
-  f = fopen(tmp, "wb");
-  int ok = f && fwrite(text, 1, keep_to - text, f) == (size_t)(keep_to - text) &&
-           fputs(insert_before, f) >= 0 && fputs(want, f) >= 0 && fputs(insert_after, f) >= 0 &&
-           fputs(resume_at, f) >= 0;
-  if (f && fclose(f))
-    ok = 0;
-  free(text);
-  if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
-    log_msg("engine: wrote %s to %s", want, path);
-  else {
-    DeleteFileA(tmp);
-    log_msg("engine: could not write %s", path);
-  }
-}
-
 /* ---------- setup -------------------------------------------------------- */
 
 static void setup(void) {
@@ -2212,7 +2129,6 @@ static void setup(void) {
   open_log();
   log_msg("sc6vrr: settings file %s (%s); environment variables take precedence", ini_path,
           GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES ? "missing" : "found");
-  apply_screen_percentage();
   cfg_uncap = env_int("SC6VRR_UNCAP", 0);
   cfg_gate = env_int("SC6VRR_GATE", 0);
   cfg_measure = env_int("SC6VRR_MEASURE", 0);
