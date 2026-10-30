@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.sc6vrr.warm-paks</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>/Users/iphoobis/Projects/SC6-VRR/tools/cache-warm/warm-paks.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>1800</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/iphoobis/Library/Logs/sc6vrr-warm-paks.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/iphoobis/Library/Logs/sc6vrr-warm-paks.log</string>
+</dict>
+</plist>
