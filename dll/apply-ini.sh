@@ -8,11 +8,6 @@
 # by hand after editing [launch] when you start the game from CrossOver.
 # CrossOver resets WINELOADER and WINEDLLOVERRIDES, so the Game Mode helper
 # stays specific to dll/launch.sh.
-# MetalHUD also goes to the user defaults of CrossOver's SC6 launcher apps
-# (~/Applications/CrossOver/SoulcaliburVI (<bottle>).app). Those apps run Wine
-# in their own process, and in SC6-FEX the HUD ignored MTL_HUD_ENABLED from
-# cxbottle.conf. MetalHUDForceEnabled is the HUD's documented app setting
-# (man MetalPerformanceHUD).
 set -euo pipefail
 here=${0:A:h}
 repo=${here:h}
@@ -23,7 +18,6 @@ sc6_ini=${SC6_INI:-$win64/sc6vrr.ini}
 [[ -f $sc6_ini ]] || { print -u2 "Missing: $sc6_ini"; exit 1; }
 source "$repo/tools/gamemode/ini-env.sh"
 game=${win64:A:h:h:h}   # .../SoulCalibur 6, with symlinks resolved
-synced=()
 
 for conf in "$bottles_dir"/*/cxbottle.conf; do
   bottle=${conf:h:t}
@@ -55,20 +49,6 @@ PY
     "$wine" --bottle "$bottle" reg add 'HKCU\Software\Wine\AppDefaults\SoulcaliburVI.exe\DllOverrides' \
       /v dinput8 /t REG_SZ /d native,builtin /f >/dev/null 2>&1
   fi
-  synced+=($bottle)
   print "Applied sc6vrr.ini [launch] to $bottle"
-done
-
-hud=$(sc6_ini_get launch MetalHUD 1)
-for plist in "$HOME/Applications/CrossOver"/*.app/Contents/Info.plist(N); do
-  [[ $(plutil -extract CXOriginalMenuName raw "$plist" 2>/dev/null) == SoulcaliburVI ]] || continue
-  (( ${synced[(Ie)$(plutil -extract CXHelperAppBottleName raw "$plist" 2>/dev/null)]} )) || continue
-  id=$(plutil -extract CFBundleIdentifier raw "$plist")
-  if [[ $hud == 1 ]]; then
-    defaults write "$id" MetalHUDForceEnabled -int 1
-  else
-    defaults delete "$id" MetalHUDForceEnabled 2>/dev/null || true
-  fi
-  print "MetalHUDForceEnabled=$hud for ${plist:h:h:t}"
 done
 print -rl -- "  "${^sc6_launch_env}
