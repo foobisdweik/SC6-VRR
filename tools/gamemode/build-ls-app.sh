@@ -23,10 +23,14 @@
 #   ("Launch requires secure launch with spawn constraints"), so the bundle is
 #   signed ad hoc. The loader keeps its hardened runtime flag and entitlements.
 #
-# Logging off: WINEDEBUG=-all, DXMT_LOG_LEVEL=none, no layer dump, no Metal
-# HUD, Wine output to /dev/null. dinput8=b makes Wine use its built-in
-# dinput8, so the SC6-VRR DLL (which always writes sc6vrr.log) does not load.
-# The DLL file stays in the game folder for test launches.
+# Settings: sc6vrr.ini next to the game exe, read at every double-click.
+# - The launcher reads [launch] (Metal HUD, DXMT options, logs) with a copy of
+#   ini-env.sh and passes the values to the game bundle with `open --env`.
+#   These keys are therefore left out of LSEnvironment.
+# - The sc6vrr dinput8.dll loads as in every other launch, and it reads
+#   [sc6vrr] and [engine] itself. SC6VRR_LOG=none turns its log off.
+# - Wine output goes to /dev/null. The Game Mode helper is not used, because
+#   macOS turns Game Mode on for this game bundle by itself.
 #
 # Rebuild after updating CrossOver Preview or the custom DXMT; the launcher
 # refuses to start when either changed.
@@ -60,21 +64,17 @@ loader=$(grep '^CX_WINELOADER=' "$work/env.txt" | cut -d= -f2-)
 # The presentation settings, shared with dll/launch.sh. This also checks that
 # Preview's DXMT matches the staged custom build.
 source "$repo/tools/gamemode/launch-env.sh"
-sc6_env_list=(${sc6_env_list:#(WINELOADER|CX_GAMEMODE_*|WINEDLLOVERRIDES|DXMT_DUMP_LAYERS|MTL_HUD_ENABLED)=*})
-sc6_env_list+=(
-  "WINEDLLOVERRIDES=d3d11,dxgi,winemetal=b;dinput8=b"
-  "DXMT_LOG_LEVEL=none" "DXMT_LOG_PATH=none" "DXMT_DUMP_LAYERS=0" "MTL_HUD_ENABLED=0"
-)
+# Keep only the fixed values; the launcher adds the [launch] values each time.
+sc6_env_list=("WINEDLLOVERRIDES=d3d11,dxgi,winemetal=b" "CX_GRAPHICS_BACKEND=dxmt")
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$game/Contents/MacOS" "$game/Contents/Resources"
 cp -p "$loader" "$game/Contents/MacOS/wine"
 ln -s "${loader:h}/ntdll.so" "$game/Contents/MacOS/ntdll.so"
 {
-  grep -E '^(CX_|WINE|GST_|DOTNET_|ROSETTA_|DXMT_ENABLE_NVEXT=|PATH=|LANG=|LC_)' "$work/env.txt" |
-    grep -v -E '^(WINELOADER|CX_INITIALIZED|WINEDLLOVERRIDES|WINEDEBUG)='
+  grep -E '^(CX_|WINE|GST_|DOTNET_|ROSETTA_|PATH=|LANG=|LC_)' "$work/env.txt" |
+    grep -v -E '^(WINELOADER|CX_INITIALIZED|WINEDLLOVERRIDES|WINEDEBUG|CX_GRAPHICS_BACKEND)='
   print -r -- "WINELOADER=$loader"
-  print -r -- "WINEDEBUG=-all"
   print -rl -- "${sc6_env_list[@]}"
 } > "$work/wine.env"
 
@@ -120,9 +120,15 @@ alert() { osascript -e "display alert \"SoulCalibur VI\" message \"\$1\"" >/dev/
 pgrep -f -q '^[A-Za-z]:.*SoulcaliburVI[.]exe' && alert "SoulCalibur VI is already running."
 shasum -a 256 -c --status "\$here/../Resources/expected.sha256" 2>/dev/null ||
   alert "CrossOver Preview or its DXMT changed. Run tools/gamemode/build-ls-app.sh in SC6-VRR again."
-exec open -a "\$here/../Helpers/SoulCalibur VI Game.app" --args ${(q)win64}/SoulcaliburVI.exe
+# Read sc6vrr.ini now, so every double-click uses the file's current values.
+sc6_ini=${(q)win64}/sc6vrr.ini
+source "\$here/../Resources/ini-env.sh"
+env_args=()
+for kv in "\${sc6_launch_env[@]}"; do env_args+=(--env "\$kv"); done
+exec open "\${env_args[@]}" -a "\$here/../Helpers/SoulCalibur VI Game.app" --args ${(q)win64}/SoulcaliburVI.exe
 EOF
 chmod +x "$app/Contents/MacOS/launch"
+cp "$here/ini-env.sh" "$app/Contents/Resources/ini-env.sh"
 
 codesign --force -s - --preserve-metadata=entitlements,flags "$game"
 codesign --force -s - "$app"

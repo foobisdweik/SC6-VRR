@@ -16,17 +16,19 @@ cmp -s "$sc6_dxmt_runtime/x86_64-unix/winemetal.so" "$cx_root/lib/dxmt/x86_64-un
   return 1
 }
 
+# The [launch] section of sc6vrr.ini (next to SoulcaliburVI.exe) sets most
+# values below. Without the file, the defaults match the earlier fixed list.
+sc6_ini=${SC6_INI:-${win64:-}/sc6vrr.ini}
+source "${${(%):-%x}:A:h}/ini-env.sh"
 sc6_env_list=(
   "WINEDLLOVERRIDES=d3d11,dxgi,winemetal=b"
-  "WINELOADER=$sc6_gamemode_helper"
-  "CX_GAMEMODE_PROCESS=SoulcaliburVI.exe"
-  "CX_GAMEMODE_DRY_RUN=0"
   "CX_GRAPHICS_BACKEND=dxmt"
-  "DXMT_CONFIG=dxgi.nativeFullscreen=True;dxgi.metalLayerPixelFormat=bgr10a2;d3d11.metalSpatialUpscale=False;d3d11.preferredMaxFrameRate=0;d3d11.pipelineArchive=False;"
-  "DXMT_METALFX_SPATIAL_SWAPCHAIN=0"
-  "DXMT_DUMP_LAYERS=${SC6_PRESENT_DIAGNOSTICS:-1}"
-  "MTL_HUD_ENABLED=${SC6_METAL_HUD:-1}"
+  "${sc6_launch_env[@]}"
 )
+# CrossOver resets WINELOADER for its own launches, so the Game Mode helper
+# works only for launches through these scripts.
+[[ $(sc6_ini_get launch GameModeHelper 1) == 1 ]] && sc6_env_list+=(
+  "WINELOADER=$sc6_gamemode_helper" "CX_GAMEMODE_PROCESS=SoulcaliburVI.exe" "CX_GAMEMODE_DRY_RUN=0")
 
 # CrossOver parses quoted assignments itself. Escape their values before passing them.
 sc6_encode_env() {

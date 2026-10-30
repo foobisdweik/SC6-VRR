@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.sc6vrr.apply-ini</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>/Users/iphoobis/Projects/SC6-VRR/dll/apply-ini.sh</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/iphoobis/Library/Logs/sc6vrr-apply-ini.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/iphoobis/Library/Logs/sc6vrr-apply-ini.log</string>
+	<key>WatchPaths</key>
+	<array>
+		<string>/Users/iphoobis/Library/Application Support/CrossOver/Bottles/SC6-Rosetta/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64/sc6vrr.ini</string>
+	</array>
+</dict>
+</plist>

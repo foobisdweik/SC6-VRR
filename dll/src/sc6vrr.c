@@ -19,7 +19,10 @@
  *    increments are skipped. The battle therefore advances 60 times per second
  *    while the engine renders faster.
  *
- * Settings come from environment variables (set them with `wine --env`):
+ * Settings come from sc6vrr.ini next to the exe ([sc6vrr] section, same key
+ * names), so every launch method (CrossOver GUI, dll/launch.sh, wine) uses one
+ * file. An environment variable with the same name takes precedence, which
+ * keeps the test scripts that pass `wine --env` reproducible:
  *   SC6VRR_UNCAP=1, SC6VRR_MAX_FPS=120, SC6VRR_GATE=1, SC6VRR_LOG=<Windows path>
  *   SC6VRR_MEASURE=1 records completed battle work and elapsed function times.
  *   SC6VRR_SHADER_DIR=<Windows path> records every shader the game creates,
@@ -45,10 +48,43 @@ static int cfg_uncap, cfg_gate, cfg_measure, cfg_frame_timers, cfg_thread_names;
 static float cfg_max_fps = 120.0f;
 static FILE *log_file;
 
+static char ini_path[MAX_PATH]; /* sc6vrr.ini next to the exe; empty if unknown */
+
+static void find_ini(void) {
+  DWORD n = GetModuleFileNameA(NULL, ini_path, sizeof(ini_path));
+  char *slash = (n && n < sizeof(ini_path)) ? strrchr(ini_path, '\\') : NULL;
+  if (slash && (size_t)(slash + 1 - ini_path) + sizeof("sc6vrr.ini") <= sizeof(ini_path))
+    strcpy(slash + 1, "sc6vrr.ini");
+  else
+    ini_path[0] = 0;
+}
+
+/* Copies setting `name` into buf and returns its length; 0 means unset or
+ * empty. The environment wins over sc6vrr.ini. Windows keeps an inline
+ * "; comment" as part of an ini value, so it is cut off here. */
+static DWORD cfg_str(const char *name, char *buf, DWORD size) {
+  DWORD n = GetEnvironmentVariableA(name, buf, size);
+  if (n && n < size)
+    return n;
+  buf[0] = 0;
+  if (!ini_path[0])
+    return 0;
+  GetPrivateProfileStringA("sc6vrr", name, "", buf, size, ini_path);
+  char *semi = strchr(buf, ';');
+  if (semi)
+    *semi = 0;
+  char *start = buf + strspn(buf, " \t");
+  size_t len = strlen(start);
+  while (len && (start[len - 1] == ' ' || start[len - 1] == '\t'))
+    len--;
+  memmove(buf, start, len);
+  buf[len] = 0;
+  return (DWORD)len;
+}
+
 static int env_int(const char *name, int fallback) {
-  char buf[32];
-  DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
-  return (n && n < sizeof(buf)) ? atoi(buf) : fallback;
+  char buf[64];
+  return cfg_str(name, buf, sizeof(buf)) ? atoi(buf) : fallback;
 }
 
 static void log_msg(const char *fmt, ...) {
@@ -69,8 +105,10 @@ static void log_msg(const char *fmt, ...) {
 
 static void open_log(void) {
   char path[MAX_PATH];
-  DWORD n = GetEnvironmentVariableA("SC6VRR_LOG", path, sizeof(path));
-  if (!n || n >= sizeof(path)) {
+  DWORD n = cfg_str("SC6VRR_LOG", path, sizeof(path));
+  if (n && !_stricmp(path, "none"))
+    return; /* no log file; log_msg() then does nothing */
+  if (!n) {
     /* Default: sc6vrr.log next to the exe. */
     n = GetModuleFileNameA(NULL, path, sizeof(path));
     char *slash = strrchr(path, '\\');
@@ -2084,10 +2122,97 @@ static int install_shader_capture(void *create_device, void *create_device_swapc
   return hooked > 0;
 }
 
+/* ---------- Engine.ini --------------------------------------------------- */
+
+/* UE4 reads Engine.ini after this DLL's DllMain, so [engine] ScreenPercentage
+ * in sc6vrr.ini is written into Engine.ini's [SystemSettings] here. That makes
+ * the setting work for every launch method. 0 leaves Engine.ini unchanged. */
+static void apply_screen_percentage(void) {
+  int pct = ini_path[0] ? (int)GetPrivateProfileIntA("engine", "ScreenPercentage", 0, ini_path) : 0;
+  if (pct <= 0)
+    return;
+  static const char tail[] = "\\SoulcaliburVI\\Saved\\Config\\WindowsNoEditor\\Engine.ini";
+  char path[MAX_PATH], tmp[MAX_PATH + 4], want[48];
+  DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", path, sizeof(path));
+  if (!n || n + sizeof(tail) > sizeof(path))
+    return;
+  strcat(path, tail);
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  int want_len = snprintf(want, sizeof(want), "r.ScreenPercentage=%d", pct);
+
+  FILE *f = fopen(path, "rb");
+  char *text = NULL;
+  long size = 0;
+  if (f) {
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    text = malloc(size + 1);
+    if (!text || fread(text, 1, size, f) != (size_t)size) {
+      fclose(f);
+      free(text);
+      log_msg("engine: could not read %s", path);
+      return;
+    }
+    fclose(f);
+  } else if (!(text = malloc(1))) {
+    return;
+  }
+  text[size] = 0;
+
+  /* Find an existing "r.ScreenPercentage=" line, else the section header. */
+  char *line = NULL, *header = NULL;
+  for (char *p = text; *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : p + strlen(p)) {
+    if (!line && !_strnicmp(p, "r.ScreenPercentage=", 19))
+      line = p;
+    if (!header && !_strnicmp(p, "[SystemSettings]", 16))
+      header = p;
+  }
+  const char *keep_to, *resume_at, *insert_before = "", *insert_after = "\r\n";
+  if (line) {
+    size_t old_len = strcspn(line, "\r\n");
+    if ((int)old_len == want_len && !memcmp(line, want, want_len)) {
+      free(text);
+      log_msg("engine: %s already set", want);
+      return;
+    }
+    keep_to = line;
+    resume_at = line + old_len;
+    insert_after = "";
+  } else if (header) {
+    char *next = strchr(header, '\n');
+    keep_to = resume_at = next ? next + 1 : header + strlen(header);
+    if (!next)
+      insert_before = "\r\n";
+  } else {
+    keep_to = resume_at = text + size;
+    insert_before = (size && text[size - 1] != '\n') ? "\r\n\r\n[SystemSettings]\r\n" : "\r\n[SystemSettings]\r\n";
+  }
+
+  /* Write a temporary file, then replace Engine.ini in one rename. */
+  f = fopen(tmp, "wb");
+  int ok = f && fwrite(text, 1, keep_to - text, f) == (size_t)(keep_to - text) &&
+           fputs(insert_before, f) >= 0 && fputs(want, f) >= 0 && fputs(insert_after, f) >= 0 &&
+           fputs(resume_at, f) >= 0;
+  if (f && fclose(f))
+    ok = 0;
+  free(text);
+  if (ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+    log_msg("engine: wrote %s to %s", want, path);
+  else {
+    DeleteFileA(tmp);
+    log_msg("engine: could not write %s", path);
+  }
+}
+
 /* ---------- setup -------------------------------------------------------- */
 
 static void setup(void) {
+  find_ini();
   open_log();
+  log_msg("sc6vrr: settings file %s (%s); environment variables take precedence", ini_path,
+          GetFileAttributesA(ini_path) == INVALID_FILE_ATTRIBUTES ? "missing" : "found");
+  apply_screen_percentage();
   cfg_uncap = env_int("SC6VRR_UNCAP", 0);
   cfg_gate = env_int("SC6VRR_GATE", 0);
   cfg_measure = env_int("SC6VRR_MEASURE", 0);
@@ -2109,9 +2234,9 @@ static void setup(void) {
   /* Shader capture hooks only d3d11.dll exports, so it does not depend on the
    * engine prologue checks below and enables its own hooks. */
   char dir[MAX_PATH];
-  DWORD dir_len = GetEnvironmentVariableA("SC6VRR_SHADER_DIR", dir, sizeof(dir));
+  DWORD dir_len = cfg_str("SC6VRR_SHADER_DIR", dir, sizeof(dir));
   cfg_skip_gs_draws = env_int("SC6VRR_SKIP_GS_DRAWS", 0);
-  if (dir_len && dir_len < sizeof(dir)) {
+  if (dir_len) {
     HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll"), dxgi = NULL;
     if (!d3d11 || !shader_capture_open(dir) ||
         !install_shader_capture((void *)GetProcAddress(d3d11, "D3D11CreateDevice"),

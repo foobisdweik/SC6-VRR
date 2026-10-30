@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Launch SC6 with the private DXMT build, native fullscreen, and Game Mode.
-# Frame timing stays stock: the DLL's frame-rate changes are off.
+# Settings come from sc6vrr.ini next to SoulcaliburVI.exe: [launch] here and in
+# dll/apply-ini.sh, [sc6vrr] and [engine] in the DLL itself.
 # Usage: dll/launch.sh
 set -euo pipefail
 here=${0:A:h}
@@ -21,13 +22,15 @@ if [[ -f $win64/dinput8.dll ]] && ! cmp -s "$here/build/dinput8.dll" "$win64/din
   cp -p "$win64/dinput8.dll" "$win64/dinput8.dll.before-unlock-$(date +%Y%m%d-%H%M%S)"
 fi
 SC6_BOTTLE=$bottle SC6_WIN64=$win64 "$here/install.sh"
-sc6_env_list+=(
-  "SC6VRR_FRAME_MODS=0" "SC6VRR_SHADER_DIR=" "SC6VRR_SKIP_GS_DRAWS=0"
-)
+[[ -f $win64/sc6vrr.ini ]] || cp "$here/sc6vrr.ini" "$win64/sc6vrr.ini"
+# Keep CrossOver GUI launches in step with this launcher.
+SC6_BOTTLE=$bottle SC6_WIN64=$win64 "$here/apply-ini.sh" >/dev/null
 sc6_encode_env "${sc6_env_list[@]}"
+# A record of this launch's process environment. The DLL's own settings are in
+# sc6vrr.ini, and the DLL logs the values it used to sc6vrr.log.
 print -rl -- "${sc6_env_list[@]}" > "$win64/unlocked-environment.txt"
 "$wine" --bottle "$bottle" --env "$sc6_env_arg" --workdir "$win64" --start "$win64/SoulcaliburVI.exe" \
   > "$win64/wine-unlocked.log" 2>&1 &
-print "Launched in $bottle with stock frame timing."
+print "Launched in $bottle with the settings in $win64/sc6vrr.ini."
 print "Log: $win64/sc6vrr.log"
 print "Presentation: native fullscreen with BGR10A2. The Game Mode policy follows the game process."
