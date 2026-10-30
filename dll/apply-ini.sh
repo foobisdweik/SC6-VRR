@@ -16,8 +16,13 @@ win64=${SC6_WIN64:-$bottles_dir/SC6-Rosetta/drive_c/Games/SoulCalibur 6/Soulcali
 wine=${CROSSOVER_APP:-/Applications/CrossOver Preview.app}/Contents/SharedSupport/CrossOver/bin/wine
 sc6_ini=${SC6_INI:-$win64/sc6vrr.ini}
 [[ -f $sc6_ini ]] || { print -u2 "Missing: $sc6_ini"; exit 1; }
-source "$repo/tools/gamemode/ini-env.sh"
 game=${win64:A:h:h:h}   # .../SoulCalibur 6, with symlinks resolved
+# launchd can start this script while an editor is still saving, and it does
+# not start it again for changes made during the run. So the script repeats
+# until the file's modification time stays the same for a whole run.
+for attempt in 1 2 3 4 5; do
+stamp=$(stat -f %m:%z "$sc6_ini")
+source "$repo/tools/gamemode/ini-env.sh"
 
 for conf in "$bottles_dir"/*/cxbottle.conf; do
   bottle=${conf:h:t}
@@ -52,3 +57,6 @@ PY
   print "Applied sc6vrr.ini [launch] to $bottle"
 done
 print -rl -- "  "${^sc6_launch_env}
+[[ $(stat -f %m:%z "$sc6_ini") == $stamp ]] && break
+sleep 1
+done
