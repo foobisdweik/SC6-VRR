@@ -23,7 +23,7 @@ game=${win64:A:h:h:h}   # .../SoulCalibur 6, with symlinks resolved
 for attempt in 1 2 3 4 5; do
 stamp=$(stat -f %m:%z "$sc6_ini")
 source "$repo/tools/gamemode/ini-env.sh"
-
+synced=()
 for conf in "$bottles_dir"/*/cxbottle.conf; do
   bottle=${conf:h:t}
   link="${conf:h}/drive_c/Games/SoulCalibur 6"
@@ -54,9 +54,31 @@ PY
     "$wine" --bottle "$bottle" reg add 'HKCU\Software\Wine\AppDefaults\SoulcaliburVI.exe\DllOverrides' \
       /v dinput8 /t REG_SZ /d native,builtin /f >/dev/null 2>&1
   fi
+  synced+=($bottle)
   print "Applied sc6vrr.ini [launch] to $bottle"
 done
 print -rl -- "  "${^sc6_launch_env}
+
+# CrossOver's SC6 launcher apps (~/Applications/CrossOver/SoulcaliburVI
+# (<bottle>).app) run the game inside their own process. Their signature does
+# not cover Info.plist ("Info.plist=not bound"), and CrossOver writes that
+# file itself. So the game-category keys can be added there, which lets macOS
+# start a real Game Mode session for the game, and MetalHudEnabled turns the
+# HUD on at launch (man MetalPerformanceHUD). CrossOver may rewrite the file
+# when it regenerates its menus; the next sync adds the keys again.
+hud=$(sc6_ini_get launch MetalHUD 1)
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+for plist in "$HOME/Applications/CrossOver"/*.app/Contents/Info.plist(N); do
+  [[ $(plutil -extract CXOriginalMenuName raw "$plist" 2>/dev/null) == SoulcaliburVI ]] || continue
+  (( ${synced[(Ie)$(plutil -extract CXHelperAppBottleName raw "$plist" 2>/dev/null)]} )) || continue
+  plutil -replace LSApplicationCategoryType -string public.app-category.games "$plist"
+  plutil -replace LSSupportsGameMode -bool YES "$plist"
+  plutil -replace GCSupportsGameMode -bool YES "$plist"
+  if [[ $hud == 1 ]]; then plutil -replace MetalHudEnabled -bool YES "$plist"
+  else plutil -remove MetalHudEnabled "$plist" 2>/dev/null || true; fi
+  $lsregister -f "${plist:h:h}"
+  print "Game category and MetalHudEnabled=$hud set in ${plist:h:h:t}"
+done
 [[ $(stat -f %m:%z "$sc6_ini") == $stamp ]] && break
 sleep 1
 done
