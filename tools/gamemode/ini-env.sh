@@ -16,7 +16,7 @@ sc6_ini_get() {  # section, key, default; an inline "; comment" is ignored
 sc6_ini_tf() { [[ $(sc6_ini_get launch "$1" "$2") == 1 ]] && print True || print False; }
 
 sc6_launch_env=(
-  "DXMT_CONFIG=dxgi.nativeFullscreen=$(sc6_ini_tf NativeFullscreen 1);dxgi.metalLayerPixelFormat=$([[ $(sc6_ini_get launch Bgr10a2Layer 1) == 1 ]] && print bgr10a2 || print auto);d3d11.metalSpatialUpscale=$(sc6_ini_tf MetalFXUpscale 0);d3d11.metalSpatialUpscaleFactor=$(sc6_ini_get launch MetalFXUpscaleFactor 2.0);d3d11.preferredMaxFrameRate=$(sc6_ini_get launch DxmtMaxFrameRate 0);d3d11.pipelineArchive=$(sc6_ini_tf PipelineArchive 0);"
+  "DXMT_CONFIG=dxgi.nativeFullscreen=$(sc6_ini_tf NativeFullscreen 1);dxgi.metalLayerPixelFormat=$([[ $(sc6_ini_get launch Bgr10a2Layer 1) == 1 ]] && print bgr10a2 || print auto);d3d11.metalSpatialUpscale=$(sc6_ini_tf MetalFXUpscale 0);d3d11.metalSpatialUpscaleFactor=$(sc6_ini_get launch MetalFXUpscaleFactor 2.0);d3d11.preferredMaxFrameRate=$(sc6_ini_get launch DxmtMaxFrameRate 0);d3d11.pipelineArchive=$(sc6_ini_tf PipelineArchive 0);dxgi.metalDisplaySync=$(sc6_ini_tf DisplaySync 0);"
   "DXMT_METALFX_SPATIAL_SWAPCHAIN=0"  # MetalFXUpscale covers the same switch
   "DXMT_ENABLE_NVEXT=$(sc6_ini_get launch NvExt 0)"
   "DXMT_DUMP_LAYERS=${SC6_PRESENT_DIAGNOSTICS:-$(sc6_ini_get launch DumpLayers 1)}"
