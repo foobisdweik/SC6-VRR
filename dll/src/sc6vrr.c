@@ -38,6 +38,8 @@
 #include <d3d11_3.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <wctype.h>
+#include <intrin.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -229,6 +231,9 @@ static size_t sample_used;
 static uint64_t sample_overflow, sample_passes, sample_open_fail, sample_suspend_fail, sample_context_fail;
 static uint64_t exe_code_lo, exe_code_hi, exe_base_now;
 static int sample_exe_ok;
+/* Set by code hooks (for example the GameInitialize timer) to clear the
+ * counts or save a snapshot, the same as F9 and F8. */
+static volatile LONG sample_req_reset, sample_req_snapshot;
 static volatile LONG sample_stop;
 
 static void find_exe_code(void) {
@@ -472,7 +477,7 @@ static DWORD WINAPI sampler_main(LPVOID unused) {
     if (sample_stop)
       break;
     int reset_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    if (reset_down && !reset_was_down) {
+    if ((reset_down && !reset_was_down) || InterlockedExchange(&sample_req_reset, 0)) {
       memset(sample_table, 0, sizeof(sample_table));
       sample_used = sample_overflow = sample_passes = 0;
       started = GetTickCount();
@@ -482,7 +487,7 @@ static DWORD WINAPI sampler_main(LPVOID unused) {
     /* F8 saves the counts so far to sc6vrr-samples.<n>.tsv and keeps counting.
      * With F9 at the start of a round, that gives one file per round. */
     int snapshot_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    if (snapshot_down && !snapshot_was_down) {
+    if ((snapshot_down && !snapshot_was_down) || InterlockedExchange(&sample_req_snapshot, 0)) {
       char numbered[MAX_PATH + 16];
       size_t stem = strlen(sample_path);
       if (stem > 4 && !_stricmp(sample_path + stem - 4, ".tsv"))
@@ -1038,9 +1043,14 @@ static float hook_get_max_tick_rate(void *self, float delta, BOOL allow_smoothin
   return orig_get_max_tick_rate(self, delta, allow_smoothing);
 }
 
+static void title_tick(void); /* SC6VRR_SKIP_TITLE; defined with the title skip */
+static volatile LONG64 g_frames; /* engine frames, counted in the UpdateTime hooks */
+
 static void hook_update_time(void *self) {
   double timing_start = cfg_measure ? qpc_seconds() : 0.0;
   orig_update_time(self);
+  g_frames++;
+  title_tick();
 
   static double last, acc, window_start;
   static unsigned frames, steps;
@@ -3501,7 +3511,6 @@ static void install_query_wait(void) {
 #define ADDR_LOGIN_NOTIFY         0x140506130ull /* sends (success, error) to the waiting Blueprint */
 #define UFUNC_NATIVE_OFFSET 0xb0
 
-static int cfg_offline_login;
 static volatile LONG offline_login_calls, offline_login_fallbacks;
 
 /* Reads one bool argument the way the game's wrapper does (P_GET_UBOOL).
@@ -3523,8 +3532,15 @@ static int frame_read_bool(uint8_t *frame) {
  * the session offline (session+0x128 = 0 makes IsOfflineMode true), and
  * reports success (1, error 0) to the waiting Blueprint without contacting a
  * server. If the session cannot be validated, it runs the original login. */
+static volatile LONG title_login_seen; /* read by the title skip */
+static int cfg_offline_login;
+
 static void offline_request_login(uint8_t *self, uint8_t *frame, void *result) {
-  (void)result;
+  InterlockedExchange(&title_login_seen, 1);
+  if (!cfg_offline_login) { /* installed only for SC6VRR_SKIP_TITLE */
+    ((void (*)(void *, void *, void *))ADDR(ADDR_REQUEST_LOGIN_NATIVE))(self, frame, result);
+    return;
+  }
   int interrupt_flow = frame_read_bool(frame);
   int startup = frame_read_bool(frame);
   uintptr_t *code = (uintptr_t *)(frame + 0x20);
@@ -3552,36 +3568,735 @@ static void offline_request_login(uint8_t *self, uint8_t *frame, void *result) {
   ((void (*)(void *, uint8_t, uint8_t))ADDR(ADDR_LOGIN_IMPL))(self, (uint8_t)interrupt_flow, (uint8_t)startup);
 }
 
-/* Waits until the engine builds the RequestLogin UFunction, then swaps its
- * native pointer. It keeps checking twice a second in case the engine binds
- * the function again. It never overwrites a pointer it does not recognize. */
-static DWORD WINAPI offline_login_watch(LPVOID unused) {
-  (void)unused;
-  void *original = ADDR(ADDR_REQUEST_LOGIN_NATIVE), *replacement = (void *)offline_request_login;
-  volatile uintptr_t *ufunc_slot = (volatile uintptr_t *)ADDR(ADDR_REQUEST_LOGIN_UFUNC);
-  int swaps = 0, warned = 0;
-  for (DWORD start = GetTickCount();;) {
-    uintptr_t ufunc = *ufunc_slot;
-    if (ufunc) {
-      void *volatile *native = (void *volatile *)(ufunc + UFUNC_NATIVE_OFFSET);
-      void *seen = InterlockedCompareExchangePointer(native, replacement, original);
-      if (seen == original)
-        log_msg("offline login: RequestLogin native pointer replaced (UFunction %p, swap %d, %lu ms after start)",
-                (void *)ufunc, ++swaps, (unsigned long)(GetTickCount() - start));
-      else if (seen != replacement && !warned++)
-        log_msg("offline login: unexpected native pointer %p (expected %p); left unchanged", seen, original);
+/* ---------- fast imports (SC6VRR_FAST_IMPORTS) ---------------------------- */
+/* In the FEX bottle, Wine's system DLLs are native ARM64 code. Every call
+ * from the game's x86 code into them leaves the emulator and comes back, which
+ * costs about 30 ns (measured 2026-10-31: TlsGetValue 29 ns in FEX, 8.4 ns in
+ * Rosetta, 2 ns for a direct TEB read). UE4's memory allocator calls
+ * TlsGetValue on every allocation and free, and string code calls towupper
+ * per character. This option points the exe's import table entries for these
+ * functions at x86 versions in this DLL, which FEX runs without leaving the
+ * emulator. Each version handles only the common case and calls the original
+ * for anything else. */
+#define TEB_LAST_ERROR     0x68   /* TEB.LastErrorValue */
+#define TEB_TLS_SLOTS      0x1480 /* TEB.TlsSlots[64] */
+#define TEB_TLS_EXPANSION  0x1780 /* TEB.TlsExpansionSlots (pointer to 1024 slots) */
+static FARPROC orig_tls_get_value;
+static wint_t (__cdecl *orig_towupper)(wint_t);
+static wint_t (__cdecl *orig_towlower)(wint_t);
+
+static LPVOID WINAPI fast_tls_get_value(DWORD index) {
+  void *value;
+  if (index < 64) {
+    value = (void *)__readgsqword(TEB_TLS_SLOTS + index * 8);
+  } else {
+    void **expansion = (void **)__readgsqword(TEB_TLS_EXPANSION);
+    if (index >= 64 + 1024 || !expansion)
+      return ((LPVOID(WINAPI *)(DWORD))orig_tls_get_value)(index); /* sets the error code itself */
+    value = expansion[index - 64];
+  }
+  __writegsdword(TEB_LAST_ERROR, ERROR_SUCCESS); /* the real function does this too */
+  return value;
+}
+
+static wint_t __cdecl fast_towupper(wint_t c) {
+  if (c < 0x80)
+    return c >= 'a' && c <= 'z' ? c - 0x20 : c;
+  return orig_towupper(c);
+}
+
+static wint_t __cdecl fast_towlower(wint_t c) {
+  if (c < 0x80)
+    return c >= 'A' && c <= 'Z' ? c + 0x20 : c;
+  return orig_towlower(c);
+}
+
+/* SC6VRR_FAST_LOCKS: the same idea for EnterCriticalSection,
+ * LeaveCriticalSection and TryEnterCriticalSection (60 ns per enter+leave in
+ * FEX, 13.6 ns with these; stress-tested with 6 threads mixing these and the
+ * originals in both bottles, 2026-10-31). */
+/* x86 fast paths for Win32 critical sections, compatible with Wine's
+ * RTL_CRITICAL_SECTION rules: LockCount is -1 when free and counts holders
+ * plus waiters from 0; the owner's recursion is in RecursionCount. Contended
+ * cases go to the original functions, which spin, wait and wake. */
+#define TEB_THREAD_ID 0x48 /* TEB.ClientId.UniqueThread */
+static void (WINAPI *orig_enter_cs)(CRITICAL_SECTION *);
+static void (WINAPI *orig_leave_cs)(CRITICAL_SECTION *);
+static BOOL (WINAPI *orig_try_enter_cs)(CRITICAL_SECTION *);
+
+static void WINAPI fast_enter_cs(CRITICAL_SECTION *cs) {
+  HANDLE self = (HANDLE)(ULONG_PTR)__readgsdword(TEB_THREAD_ID);
+  if (InterlockedCompareExchange(&cs->LockCount, 0, -1) == -1) {
+    cs->OwningThread = self;
+    cs->RecursionCount = 1;
+    return;
+  }
+  if (cs->OwningThread == self) {
+    InterlockedIncrement(&cs->LockCount);
+    cs->RecursionCount++;
+    return;
+  }
+  orig_enter_cs(cs);
+}
+
+static void WINAPI fast_leave_cs(CRITICAL_SECTION *cs) {
+  if (cs->RecursionCount > 1) {
+    cs->RecursionCount--;
+    InterlockedDecrement(&cs->LockCount);
+    return;
+  }
+  if (cs->RecursionCount != 1) {
+    orig_leave_cs(cs); /* not held: let the original report it */
+    return;
+  }
+  HANDLE self = cs->OwningThread;
+  cs->OwningThread = 0;
+  cs->RecursionCount = 0;
+  if (InterlockedCompareExchange(&cs->LockCount, -1, 0) == 0)
+    return; /* nobody waits */
+  /* Someone waits: restore the held state and let the original release and wake. */
+  cs->OwningThread = self;
+  cs->RecursionCount = 1;
+  orig_leave_cs(cs);
+}
+
+static BOOL WINAPI fast_try_enter_cs(CRITICAL_SECTION *cs) {
+  HANDLE self = (HANDLE)(ULONG_PTR)__readgsdword(TEB_THREAD_ID);
+  if (InterlockedCompareExchange(&cs->LockCount, 0, -1) == -1) {
+    cs->OwningThread = self;
+    cs->RecursionCount = 1;
+    return TRUE;
+  }
+  if (cs->OwningThread == self) {
+    InterlockedIncrement(&cs->LockCount);
+    cs->RecursionCount++;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/* Replaces the main exe's import of dll!name (dll matched without case and
+ * by prefix, so "api-ms-win-crt-string" matches its versioned name). Returns
+ * the old target, or NULL if the import was not found. */
+static void *patch_exe_import(const char *dll, const char *name, void *replacement) {
+  uint8_t *base = (uint8_t *)GetModuleHandleW(NULL);
+  IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+  IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++) {
+    if (_strnicmp((char *)(base + d->Name), dll, strlen(dll)))
+      continue;
+    IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(base + d->OriginalFirstThunk);
+    IMAGE_THUNK_DATA64 *slots = (IMAGE_THUNK_DATA64 *)(base + d->FirstThunk);
+    for (; names->u1.AddressOfData; names++, slots++) {
+      if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal))
+        continue;
+      if (strcmp((char *)((IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData))->Name, name))
+        continue;
+      DWORD old;
+      void *previous = (void *)slots->u1.Function;
+      if (!VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old))
+        return NULL;
+      slots->u1.Function = (ULONGLONG)replacement;
+      VirtualProtect(&slots->u1.Function, 8, old, &old);
+      return previous;
     }
-    Sleep(swaps ? 500 : 5);
+  }
+  return NULL;
+}
+
+/* SC6VRR_FAST_CRT: x86 versions of the next most-called imports (counts
+ * from SC6VRR_COUNT_IMPORTS for one boot to the main menu, 2026-10-31):
+ * memcpy 43.7 M, GetCurrentThreadId 19.4 M, toupper 17.8 M, memset 5.8 M,
+ * _stricmp 4.1 M, _wcsnicmp 3.5 M, memmove 1.4 M. Copies and fills of more
+ * than FAST_MEM_MAX bytes still go to the native code, which is faster for
+ * big blocks. The string functions handle ASCII only (the C locale's rules)
+ * and give the whole call to the original when they meet any other
+ * character. */
+#define FAST_MEM_MAX 64
+static void *(__cdecl *orig_memcpy)(void *, const void *, size_t);
+static void *(__cdecl *orig_memmove)(void *, const void *, size_t);
+static void *(__cdecl *orig_memset)(void *, int, size_t);
+static int (__cdecl *orig_toupper)(int);
+static int (__cdecl *orig_stricmp)(const char *, const char *);
+static int (__cdecl *orig_wcsnicmp)(const wchar_t *, const wchar_t *, size_t);
+
+/* Small copy through registers and a stack buffer, so overlapping source and
+ * destination are safe (MSVC's memcpy is a memmove, and code relies on it).
+ * The constant-size __builtin_memcpy calls compile to plain moves. */
+static inline void small_move(uint8_t *d, const uint8_t *s, size_t n) {
+  uint8_t tmp[FAST_MEM_MAX];
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    __builtin_memcpy(tmp + i, s + i, 8);
+  for (; i < n; i++)
+    tmp[i] = s[i];
+  for (i = 0; i + 8 <= n; i += 8)
+    __builtin_memcpy(d + i, tmp + i, 8);
+  for (; i < n; i++)
+    d[i] = tmp[i];
+}
+
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+static void *__cdecl fast_memcpy(void *dst, const void *src, size_t n) {
+  if (n > FAST_MEM_MAX)
+    return orig_memcpy(dst, src, n);
+  small_move(dst, src, n);
+  return dst;
+}
+
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+static void *__cdecl fast_memmove(void *dst, const void *src, size_t n) {
+  if (n > FAST_MEM_MAX)
+    return orig_memmove(dst, src, n);
+  small_move(dst, src, n);
+  return dst;
+}
+
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+static void *__cdecl fast_memset(void *dst, int c, size_t n) {
+  if (n > FAST_MEM_MAX)
+    return orig_memset(dst, c, n);
+  uint8_t *d = dst;
+  uint64_t v = 0x0101010101010101ull * (uint8_t)c;
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8)
+    __builtin_memcpy(d + i, &v, 8);
+  for (; i < n; i++)
+    d[i] = (uint8_t)c;
+  return dst;
+}
+
+static DWORD WINAPI fast_get_current_thread_id(void) { return __readgsdword(TEB_THREAD_ID); }
+
+static int __cdecl fast_toupper(int c) {
+  if (c >= 0 && c < 0x80)
+    return c >= 'a' && c <= 'z' ? c - 0x20 : c;
+  return orig_toupper(c);
+}
+
+static int __cdecl fast_stricmp(const char *a, const char *b) {
+  for (size_t i = 0;; i++) {
+    unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+    if ((x | y) & 0x80)
+      return orig_stricmp(a, b);
+    if (x >= 'A' && x <= 'Z') x += 0x20;
+    if (y >= 'A' && y <= 'Z') y += 0x20;
+    if (x != y || !x)
+      return (int)x - (int)y;
+  }
+}
+
+static int __cdecl fast_wcsnicmp(const wchar_t *a, const wchar_t *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    wchar_t x = a[i], y = b[i];
+    if (x >= 0x80 || y >= 0x80)
+      return orig_wcsnicmp(a, b, n);
+    if (x >= 'A' && x <= 'Z') x += 0x20;
+    if (y >= 'A' && y <= 'Z') y += 0x20;
+    if (x != y || !x)
+      return (int)x - (int)y;
   }
   return 0;
 }
 
-static void start_offline_login(void) {
-  HANDLE h = CreateThread(NULL, 0, offline_login_watch, NULL, 0, NULL);
+/* Battle counts (Training mode, 2026-10-31): sqrtf 2252 calls per frame,
+ * _finite 192, _isnan 88. sqrtss gives exactly the CRT's result (IEEE square
+ * root is correctly rounded); negative and NaN inputs go to the original,
+ * which also sets errno. _finite and _isnan are bit tests. powf, sinf, cosf,
+ * expf, atan2f and acosf are left alone: another implementation can differ in
+ * the last bit, and the battle logic may depend on exact float results. */
+static float (__cdecl *orig_sqrtf)(float);
+static float __cdecl fast_sqrtf(float x) {
+  if (!(x >= 0.0f)) /* negative or NaN */
+    return orig_sqrtf(x);
+  float r;
+  __asm__("sqrtss %1, %0" : "=x"(r) : "x"(x));
+  return r;
+}
+static int __cdecl fast_finite(double x) {
+  uint64_t b;
+  __builtin_memcpy(&b, &x, 8);
+  return ((b >> 52) & 0x7ff) != 0x7ff;
+}
+static int __cdecl fast_isnan(double x) {
+  uint64_t b;
+  __builtin_memcpy(&b, &x, 8);
+  return ((b >> 52) & 0x7ff) == 0x7ff && (b & 0xfffffffffffffull) != 0;
+}
+
+static void install_fast_crt(void) {
+  struct { const char *dll, *name; void *fast; void **orig; } list[] = {
+    {"VCRUNTIME140.dll", "memcpy", (void *)fast_memcpy, (void **)&orig_memcpy},
+    {"VCRUNTIME140.dll", "memmove", (void *)fast_memmove, (void **)&orig_memmove},
+    {"VCRUNTIME140.dll", "memset", (void *)fast_memset, (void **)&orig_memset},
+    {"KERNEL32.dll", "GetCurrentThreadId", (void *)fast_get_current_thread_id, NULL},
+    {"api-ms-win-crt-string", "toupper", (void *)fast_toupper, (void **)&orig_toupper},
+    {"api-ms-win-crt-string", "_stricmp", (void *)fast_stricmp, (void **)&orig_stricmp},
+    {"api-ms-win-crt-string", "_wcsnicmp", (void *)fast_wcsnicmp, (void **)&orig_wcsnicmp},
+    {"api-ms-win-crt-math", "sqrtf", (void *)fast_sqrtf, (void **)&orig_sqrtf},
+    {"api-ms-win-crt-math", "_finite", (void *)fast_finite, NULL},
+    {"api-ms-win-crt-math", "_isnan", (void *)fast_isnan, NULL},
+  };
+  int done = 0;
+  for (size_t i = 0; i < sizeof(list) / sizeof(list[0]); i++) {
+    void *previous = patch_exe_import(list[i].dll, list[i].name, list[i].fast);
+    if (list[i].orig)
+      *list[i].orig = previous;
+    if (previous)
+      done++;
+    else
+      log_msg("fast crt: %s!%s not imported; left alone", list[i].dll, list[i].name);
+  }
+  log_msg("fast crt: %d of %d imports now run as x86 code in this DLL", done, (int)(sizeof(list) / sizeof(list[0])));
+}
+
+/* SC6VRR_COUNT_IMPORTS=1 (diagnostics): every code import of the exe goes
+ * through a 14-byte stub, "lock inc qword [counter]; jmp [target]", so the
+ * log can list the most-called imports. A jump (not a call) leaves the stack
+ * and return address untouched. Imports whose target is not executable
+ * memory (data imports) are left alone. The counts are logged at the scene
+ * change to "mainmenu" (import_counts_dump). */
+#define COUNT_MAX 2048
+typedef struct { uint64_t count; void *target; const char *dll, *name; } import_count;
+static import_count *import_counts;
+static int import_count_n;
+
+static double count_window_start;
+static DWORD WINAPI import_count_keys(LPVOID unused);
+
+static void install_import_counters(void) {
+  uint8_t *base = (uint8_t *)GetModuleHandleW(NULL);
+  IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+  IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  uint8_t *code = VirtualAlloc(NULL, COUNT_MAX * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  import_counts = VirtualAlloc(NULL, COUNT_MAX * sizeof(import_count), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!code || !import_counts) {
+    log_msg("count imports: allocation failed");
+    return;
+  }
+  int skipped = 0;
+  for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++) {
+    IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(base + d->OriginalFirstThunk);
+    IMAGE_THUNK_DATA64 *slots = (IMAGE_THUNK_DATA64 *)(base + d->FirstThunk);
+    for (; names->u1.AddressOfData && import_count_n < COUNT_MAX; names++, slots++) {
+      MEMORY_BASIC_INFORMATION mbi;
+      void *target = (void *)slots->u1.Function;
+      if (!VirtualQuery(target, &mbi, sizeof(mbi)) ||
+          !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+        skipped++;
+        continue;
+      }
+      import_count *c = &import_counts[import_count_n];
+      c->target = target;
+      c->dll = (char *)(base + d->Name);
+      c->name = IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)
+                    ? "(ordinal)"
+                    : (char *)((IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData))->Name;
+      uint8_t *st = code + import_count_n * 16;
+      int32_t to_count = (int32_t)((uint8_t *)&c->count - (st + 8));
+      int32_t to_target = (int32_t)((uint8_t *)&c->target - (st + 14));
+      if ((int64_t)((uint8_t *)&c->count - (st + 8)) != to_count) {
+        log_msg("count imports: counters out of rel32 reach; stopped");
+        return;
+      }
+      st[0] = 0xF0; st[1] = 0x48; st[2] = 0xFF; st[3] = 0x05; /* lock inc qword [rip+disp32] */
+      memcpy(st + 4, &to_count, 4);
+      st[8] = 0xFF; st[9] = 0x25; /* jmp qword [rip+disp32] */
+      memcpy(st + 10, &to_target, 4);
+      DWORD old;
+      VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old);
+      slots->u1.Function = (ULONGLONG)st;
+      VirtualProtect(&slots->u1.Function, 8, old, &old);
+      import_count_n++;
+    }
+  }
+  FlushInstructionCache(GetCurrentProcess(), code, COUNT_MAX * 16);
+  count_window_start = qpc_seconds();
+  HANDLE h = CreateThread(NULL, 0, import_count_keys, NULL, 0, NULL);
+  if (h)
+    CloseHandle(h);
+  log_msg("count imports: %d imports counted, %d data imports skipped; F9 clears, F8 logs the top 40", import_count_n,
+          skipped);
+}
+
+static int import_count_cmp(const void *a, const void *b) {
+  uint64_t x = ((const import_count *)a)->count, y = ((const import_count *)b)->count;
+  return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static LONG64 count_window_frames;
+
+static void import_counts_dump(const char *why) {
+  if (!import_count_n)
+    return;
+  static import_count sorted[COUNT_MAX];
+  memcpy(sorted, import_counts, import_count_n * sizeof(import_count));
+  qsort(sorted, import_count_n, sizeof(import_count), import_count_cmp);
+  double secs = qpc_seconds() - count_window_start;
+  LONG64 frames = g_frames - count_window_frames;
+  log_msg("count imports: top imports over %.1f s and %lld frames (%s)", secs, (long long)frames, why);
+  for (int i = 0; i < 40 && i < import_count_n && sorted[i].count; i++)
+    log_msg("count imports: %10llu calls %10.0f/s %8.1f/frame %s!%s", (unsigned long long)sorted[i].count,
+            sorted[i].count / (secs > 0 ? secs : 1), frames > 0 ? (double)sorted[i].count / frames : 0.0,
+            sorted[i].dll, sorted[i].name);
+}
+
+static void import_counts_reset(void) {
+  for (int i = 0; i < import_count_n; i++)
+    InterlockedExchange64((volatile LONG64 *)&import_counts[i].count, 0);
+  count_window_start = qpc_seconds();
+  count_window_frames = g_frames;
+  log_msg("count imports: counts cleared by F9");
+}
+
+/* F9 clears the counts and F8 logs the top imports since then, the same keys
+ * as the sampler. Polled every 50 ms by a helper thread. */
+static DWORD WINAPI import_count_keys(LPVOID unused) {
+  (void)unused;
+  int f9_was = 0, f8_was = 0;
+  for (;;) {
+    Sleep(50);
+    int f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0, f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (f9 && !f9_was)
+      import_counts_reset();
+    if (f8 && !f8_was)
+      import_counts_dump("F8");
+    f9_was = f9;
+    f8_was = f8;
+  }
+  return 0;
+}
+
+static void install_fast_locks(void) {
+  orig_enter_cs = (void(WINAPI *)(CRITICAL_SECTION *))patch_exe_import("KERNEL32.dll", "EnterCriticalSection", (void *)fast_enter_cs);
+  orig_leave_cs = (void(WINAPI *)(CRITICAL_SECTION *))patch_exe_import("KERNEL32.dll", "LeaveCriticalSection", (void *)fast_leave_cs);
+  orig_try_enter_cs = (BOOL(WINAPI *)(CRITICAL_SECTION *))patch_exe_import("KERNEL32.dll", "TryEnterCriticalSection", (void *)fast_try_enter_cs);
+  if (!orig_enter_cs || !orig_leave_cs || !orig_try_enter_cs) {
+    /* All three or none: a lock taken by one version must be released by a
+     * compatible one, and a missing original would crash the fallback. */
+    if (orig_enter_cs) patch_exe_import("KERNEL32.dll", "EnterCriticalSection", (void *)orig_enter_cs);
+    if (orig_leave_cs) patch_exe_import("KERNEL32.dll", "LeaveCriticalSection", (void *)orig_leave_cs);
+    if (orig_try_enter_cs) patch_exe_import("KERNEL32.dll", "TryEnterCriticalSection", (void *)orig_try_enter_cs);
+    log_msg("fast locks: an import was missing; all three restored");
+    return;
+  }
+  log_msg("fast locks: Enter/Leave/TryEnterCriticalSection now run as x86 code in this DLL");
+}
+
+static void install_fast_imports(void) {
+  orig_tls_get_value = (FARPROC)patch_exe_import("KERNEL32.dll", "TlsGetValue", (void *)fast_tls_get_value);
+  orig_towupper = (wint_t(__cdecl *)(wint_t))patch_exe_import("api-ms-win-crt-string", "towupper", (void *)fast_towupper);
+  orig_towlower = (wint_t(__cdecl *)(wint_t))patch_exe_import("api-ms-win-crt-string", "towlower", (void *)fast_towlower);
+  /* A missing original would make the fallbacks crash, so undo that entry. */
+  if (orig_towupper == NULL || orig_towlower == NULL || orig_tls_get_value == NULL)
+    log_msg("fast imports: some imports not found (TlsGetValue %p, towupper %p, towlower %p)",
+            (void *)orig_tls_get_value, (void *)orig_towupper, (void *)orig_towlower);
+  else
+    log_msg("fast imports: TlsGetValue, towupper and towlower now run as x86 code in this DLL");
+}
+
+/* ---------- title-screen skip --------------------------------------------- */
+/* SC6VRR_SKIP_TITLE=1 presses Start for the player on the "press any button"
+ * title screen. The game has a Blueprint-callable test helper,
+ * EmulateTitleDecide (wrapper 0x140abcef0), that queues one emulated press
+ * of the gamepad Start key (UE4 key Gamepad_Special_Right) for player 0 in
+ * the game's input manager. The DLL calls that helper's code on the game
+ * thread, from the UpdateTime hook that runs once per frame, because the
+ * input manager has no lock. Presses start after the title Blueprint first
+ * calls IsEnableTitleMovie (a sign that the title screen exists) and stop as
+ * soon as the title calls RequestLogin (the step that follows Start). */
+#define ADDR_TITLE_MOVIE_UFUNC    0x14415b258ull /* UFunction* IsEnableTitleMovie */
+#define ADDR_SHARED_BOOL_NATIVE   0x1409e1f20ull /* its wrapper, shared with IsCeBankEnable and LoadFromSaveData */
+#define ADDR_EMULATE_TITLE_DECIDE 0x1404b9e10ull /* queues a Start press for player 0 */
+#define TITLE_FIRST_PRESS_S 0.3  /* delay after the title signal before the first press */
+#define TITLE_PRESS_EVERY_S 0.5  /* repeat in case the title was not yet accepting input */
+#define TITLE_MAX_PRESSES   40
+
+static int cfg_skip_title;
+static volatile LONG title_seen;
+
+static void title_movie_passthrough(void *self, void *frame, void *result) {
+  ((void (*)(void *, void *, void *))ADDR(ADDR_SHARED_BOOL_NATIVE))(self, frame, result);
+  if (!InterlockedExchange(&title_seen, 1))
+    log_msg("skip title: IsEnableTitleMovie called (returned %d); title screen is up",
+            *(uint8_t *)result);
+}
+
+/* Runs on the game thread once per frame. */
+static void title_tick(void) {
+  static double seen_at, last_press;
+  static int presses, done;
+  if (cfg_skip_title != 1 || done || !title_seen)
+    return;
+  double now = qpc_seconds();
+  if (title_login_seen || presses >= TITLE_MAX_PRESSES) {
+    log_msg("skip title: stopped after %d emulated Start presses (%s)", presses,
+            title_login_seen ? "RequestLogin was called" : "press limit reached");
+    done = 1;
+    return;
+  }
+  if (seen_at == 0.0)
+    seen_at = now;
+  if (now - seen_at < TITLE_FIRST_PRESS_S || (presses && now - last_press < TITLE_PRESS_EVERY_S))
+    return;
+  ((void (*)(void))ADDR(ADDR_EMULATE_TITLE_DECIDE))();
+  last_press = now;
+  log_msg("skip title: emulated Start press %d (%.2f s after the title signal)", ++presses, now - seen_at);
+}
+
+/* The UpdateTime hook for SC6VRR_FRAME_MODS=0: only the title tick. */
+static void hook_update_time_tick(void *self) {
+  orig_update_time(self);
+  g_frames++;
+  title_tick();
+}
+
+/* ---------- title native-call trace (SC6VRR_TRACE_TITLE) ------------------ */
+/* Every call from script into native code passes through UFunction::Invoke
+ * (0x140e76180: this=UFunction, object, FFrame, result). Between the scene
+ * changes to "Title" and "mainmenu", this records each distinct native
+ * function once, in the order of first use, so the title's setup steps can
+ * be named offline from the exe's native tables. Diagnostics only. */
+#define ADDR_UFUNCTION_INVOKE 0x140e76180ull
+#define TRACE_MAX 768
+typedef void (*ufunc_invoke_fn)(void *, void *, void *, void *);
+static ufunc_invoke_fn orig_ufunc_invoke;
+static volatile LONG trace_title_active;
+static double trace_title_start;
+static SRWLOCK trace_lock = SRWLOCK_INIT;
+static struct { void *native, *ufunc, *obj, *obj_class; double t; unsigned count; } trace_rows[TRACE_MAX];
+static int trace_count;
+
+static void hook_ufunc_invoke(void *fn, void *obj, void *stack, void *result) {
+  if (trace_title_active && fn) {
+    void *native = *(void **)((uint8_t *)fn + UFUNC_NATIVE_OFFSET);
+    AcquireSRWLockExclusive(&trace_lock);
+    int i = 0;
+    while (i < trace_count && trace_rows[i].native != native)
+      i++;
+    if (i < trace_count)
+      trace_rows[i].count++;
+    else if (trace_count < TRACE_MAX)
+      trace_rows[trace_count++] = (typeof(trace_rows[0])){native, fn, obj, obj ? *(void **)((uint8_t *)obj + 0x10) : NULL,
+                                                          qpc_seconds() - trace_title_start, 1};
+    ReleaseSRWLockExclusive(&trace_lock);
+  }
+  orig_ufunc_invoke(fn, obj, stack, result);
+}
+
+static void trace_title_dump(const char *why) {
+  InterlockedExchange(&trace_title_active, 0);
+  AcquireSRWLockExclusive(&trace_lock);
+  uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+  log_msg("trace: %d distinct native functions during the title (%s); addresses use Ghidra's numbering", trace_count,
+          why);
+  for (int i = 0; i < trace_count; i++) {
+    uintptr_t n = (uintptr_t)trace_rows[i].native;
+    log_msg("trace: %3d t=%7.3f n=%5u native=0x%llx ufunc=%p obj=%p class=%p", i, trace_rows[i].t,
+            trace_rows[i].count, (unsigned long long)(n - base + 0x140000000ull), trace_rows[i].ufunc,
+            trace_rows[i].obj, trace_rows[i].obj_class);
+  }
+  trace_count = 0;
+  ReleaseSRWLockExclusive(&trace_lock);
+}
+
+/* With SC6VRR_TRACE_TITLE, GameInitialize's implementation (the native
+ * wrapper 0x140cb3800 jumps to 0x140636c10) is timed. With SC6VRR_SAMPLE=1
+ * too, the sampler clears its counts when the function starts and saves a
+ * numbered snapshot when it returns, so that snapshot covers only it. */
+#define ADDR_GAME_INITIALIZE_IMPL 0x140636c10ull
+typedef void (*game_initialize_fn)(void *);
+static game_initialize_fn orig_game_initialize;
+
+static void hook_game_initialize(void *self) {
+  if (cfg_sample) {
+    InterlockedExchange(&sample_req_reset, 1);
+    Sleep(20); /* let the sampler clear its counts before the work starts */
+  }
+  double t0 = qpc_seconds();
+  orig_game_initialize(self);
+  double ms = (qpc_seconds() - t0) * 1000.0;
+  if (cfg_sample)
+    InterlockedExchange(&sample_req_snapshot, 1);
+  log_msg("trace: GameInitialize took %.1f ms on thread %lu%s", ms, (unsigned long)GetCurrentThreadId(),
+          cfg_sample ? "; sampler snapshot requested" : "");
+}
+
+/* The five steps that GameInitialize's implementation runs, timed one by
+ * one (with SC6VRR_TRACE_TITLE). Each takes one pointer argument. */
+#define GI_STEP(n, addr, prologue)                                                     \
+  static void (*orig_gi_step##n)(void *);                                              \
+  static void hook_gi_step##n(void *arg) {                                             \
+    double t0 = qpc_seconds();                                                         \
+    orig_gi_step##n(arg);                                                              \
+    log_msg("trace: GameInitialize step %d (0x%llx) took %.1f ms", n,                  \
+            (unsigned long long)(addr), (qpc_seconds() - t0) * 1000.0);                \
+  }
+GI_STEP(1, 0x1406458a0ull, "48895c2408574883ec60")
+GI_STEP(2, 0x140645dd0ull, "4055574155488d6c24b9")
+GI_STEP(3, 0x140502ff0ull, "4055564154488d6c24b9")
+GI_STEP(4, 0x1404fe3d0ull, "488bc45553488da868ff")
+GI_STEP(5, 0x1404fc7e0ull, "488bc44889582055488b")
+GI_STEP(11, 0x1406485f0ull, "488bc4554156488da848")
+GI_STEP(12, 0x140647e90ull, "488bc45556488da8f8fe")
+static const struct { uint64_t addr; const char *prologue; void *hook; void **orig; } gi_steps[] = {
+  {0x1406458a0ull, "48895c2408574883ec60", (void *)hook_gi_step1, (void **)&orig_gi_step1},
+  {0x140645dd0ull, "4055574155488d6c24b9", (void *)hook_gi_step2, (void **)&orig_gi_step2},
+  {0x140502ff0ull, "4055564154488d6c24b9", (void *)hook_gi_step3, (void **)&orig_gi_step3},
+  {0x1404fe3d0ull, "488bc45553488da868ff", (void *)hook_gi_step4, (void **)&orig_gi_step4},
+  {0x1404fc7e0ull, "488bc44889582055488b", (void *)hook_gi_step5, (void **)&orig_gi_step5},
+  /* Steps 11 and 12 are the two helpers that step 1 calls first. */
+  {0x1406485f0ull, "488bc4554156488da848", (void *)hook_gi_step11, (void **)&orig_gi_step11},
+  {0x140647e90ull, "488bc45556488da8f8fe", (void *)hook_gi_step12, (void **)&orig_gi_step12},
+};
+
+static void install_title_trace(void) {
+  if (!bytes_match(ADDR(ADDR_UFUNCTION_INVOKE), "48895c240848896c2410488974241848897c2420")) {
+    log_msg("trace: UFunction::Invoke prologue mismatch; trace off");
+    return;
+  }
+  MH_STATUS st = MH_CreateHook(ADDR(ADDR_UFUNCTION_INVOKE), hook_ufunc_invoke, (void **)&orig_ufunc_invoke);
+  if (st == MH_OK)
+    st = MH_EnableHook(ADDR(ADDR_UFUNCTION_INVOKE));
+  log_msg("trace: UFunction::Invoke hook %s (%d)", st == MH_OK ? "on" : "failed", st);
+  if (!bytes_match(ADDR(ADDR_GAME_INITIALIZE_IMPL), "40534883ec20488bd9488b8968020000")) {
+    log_msg("trace: GameInitialize prologue mismatch; not timed");
+    return;
+  }
+  st = MH_CreateHook(ADDR(ADDR_GAME_INITIALIZE_IMPL), hook_game_initialize, (void **)&orig_game_initialize);
+  if (st == MH_OK)
+    st = MH_EnableHook(ADDR(ADDR_GAME_INITIALIZE_IMPL));
+  log_msg("trace: GameInitialize timer %s (%d)", st == MH_OK ? "on" : "failed", st);
+  for (size_t i = 0; i < sizeof(gi_steps) / sizeof(gi_steps[0]); i++) {
+    if (!bytes_match(ADDR(gi_steps[i].addr), gi_steps[i].prologue)) {
+      log_msg("trace: GameInitialize step %d prologue mismatch; not timed", (int)i + 1);
+      continue;
+    }
+    st = MH_CreateHook(ADDR(gi_steps[i].addr), gi_steps[i].hook, gi_steps[i].orig);
+    if (st == MH_OK)
+      st = MH_EnableHook(ADDR(gi_steps[i].addr));
+    if (st != MH_OK)
+      log_msg("trace: GameInitialize step %d hook failed (%d)", (int)i + 1, st);
+  }
+}
+
+/* ---------- scene-change log (SC6VRR_LOG_SCENES) --------------------------- */
+/* GameFlowManager::ChangeScene (native wrapper 0x142f7a890) parses an FString
+ * scene name and a data struct, then calls this implementation. The scene
+ * names come from the game's data files, so the log shows which names the
+ * boot uses. Diagnostics only: the hook changes nothing. */
+#define ADDR_FLOW_CHANGE_SCENE 0x142ef6e30ull /* (manager, FString *name, data *, ?) */
+typedef struct { wchar_t *data; int32_t num, max; } ue_fstring;
+typedef void (*flow_change_scene_fn)(void *, ue_fstring *, void *, void *);
+static flow_change_scene_fn orig_flow_change_scene;
+
+static void hook_flow_change_scene(void *mgr, ue_fstring *name, void *data, void *extra) {
+  char text[256] = "?";
+  if (name && name->data && name->num > 0)
+    WideCharToMultiByte(CP_UTF8, 0, name->data, -1, text, sizeof(text), NULL, NULL);
+  log_msg("scene: ChangeScene \"%s\" (manager %p, title_seen=%ld, login_seen=%ld)", text, mgr, title_seen,
+          title_login_seen);
+  if (name && name->data && !_wcsicmp(name->data, L"mainmenu"))
+    import_counts_dump("scene change to mainmenu");
+  if (orig_ufunc_invoke) {
+    if (!_wcsicmp(name && name->data ? name->data : L"", L"Title")) {
+      trace_title_start = qpc_seconds();
+      InterlockedExchange(&trace_title_active, 1);
+    } else if (trace_title_active) {
+      trace_title_dump(text);
+    }
+  }
+  /* SC6VRR_SKIP_TITLE=2 (EXPERIMENTAL, BROKEN): ask for the main menu
+   * instead of the title screen, once per run. Tested 2026-10-31: the menu
+   * then fades in and out forever, because the title does setup that the
+   * menu needs (RequestDecideMainUser, StartSaveDataCheckFlow,
+   * GameInitialize, RequestStartUpTask; see SC6VRR_TRACE_TITLE). The implementation only reads and copies the name (it
+   * copies at 0x142ef6ee8, and the wrapper frees its own string afterwards),
+   * so a string on this stack is safe. FString.num counts the final NUL. */
+  static int redirected;
+  if (cfg_skip_title == 2 && !redirected && name && name->data && !_wcsicmp(name->data, L"Title")) {
+    static wchar_t main_menu[] = L"mainmenu";
+    ue_fstring replacement = {main_menu, (int32_t)(sizeof(main_menu) / sizeof(wchar_t)),
+                              (int32_t)(sizeof(main_menu) / sizeof(wchar_t))};
+    redirected = 1;
+    log_msg("skip title: ChangeScene \"Title\" replaced by \"mainmenu\"");
+    orig_flow_change_scene(mgr, &replacement, data, extra);
+    return;
+  }
+  orig_flow_change_scene(mgr, name, data, extra);
+}
+
+static void install_scene_log(void) {
+  if (!bytes_match(ADDR(ADDR_FLOW_CHANGE_SCENE), "488bc44c8948204c89401855564156")) {
+    log_msg("scene: ChangeScene prologue mismatch; scene log off");
+    return;
+  }
+  MH_STATUS st = MH_CreateHook(ADDR(ADDR_FLOW_CHANGE_SCENE), hook_flow_change_scene, (void **)&orig_flow_change_scene);
+  if (st == MH_OK)
+    st = MH_EnableHook(ADDR(ADDR_FLOW_CHANGE_SCENE));
+  log_msg("scene: ChangeScene log %s (%d)", st == MH_OK ? "on" : "failed", st);
+}
+
+/* ---------- UFunction pointer swaps --------------------------------------- */
+/* Waits until the engine builds each UFunction, then swaps its native
+ * pointer, and then exits. It must not keep running: at shutdown UE4 frees
+ * the UFunctions while the static pointers to them remain, so a later check
+ * would touch freed memory (this crashed the game on quit, 2026-10-31). It
+ * never overwrites a pointer it does not recognize. */
+typedef struct {
+  const char *name;
+  uint64_t ufunc_slot, original;
+  void *replacement;
+  int swaps, warned;
+} ufunc_swap;
+
+static ufunc_swap ufunc_swaps[2];
+static int ufunc_swap_count;
+static volatile LONG ufunc_watch_stop; /* set at process detach */
+
+static DWORD WINAPI ufunc_watch(LPVOID unused) {
+  (void)unused;
+  for (DWORD start = GetTickCount(); !ufunc_watch_stop;) {
+    int pending = 0;
+    for (int i = 0; i < ufunc_swap_count; i++) {
+      ufunc_swap *w = &ufunc_swaps[i];
+      uintptr_t ufunc = *(volatile uintptr_t *)ADDR(w->ufunc_slot);
+      pending += !w->swaps;
+      if (!ufunc)
+        continue;
+      void *original = ADDR(w->original);
+      void *seen = InterlockedCompareExchangePointer((void *volatile *)(ufunc + UFUNC_NATIVE_OFFSET),
+                                                     w->replacement, original);
+      if (seen == original)
+        log_msg("ufunc swap: %s native pointer replaced (UFunction %p, swap %d, %lu ms after start)", w->name,
+                (void *)ufunc, ++w->swaps, (unsigned long)(GetTickCount() - start));
+      else if (seen != w->replacement && !w->warned++)
+        log_msg("ufunc swap: %s has unexpected native pointer %p (expected %p); left unchanged", w->name, seen,
+                original);
+    }
+    if (!pending) {
+      log_msg("ufunc swap: all %d swaps done; watcher stopped", ufunc_swap_count);
+      break;
+    }
+    Sleep(5);
+  }
+  return 0;
+}
+
+static void start_ufunc_swaps(void) {
+  if (cfg_offline_login || cfg_skip_title)
+    ufunc_swaps[ufunc_swap_count++] = (ufunc_swap){"RequestLogin", ADDR_REQUEST_LOGIN_UFUNC,
+                                                   ADDR_REQUEST_LOGIN_NATIVE, (void *)offline_request_login};
+  if (cfg_skip_title)
+    ufunc_swaps[ufunc_swap_count++] = (ufunc_swap){"IsEnableTitleMovie", ADDR_TITLE_MOVIE_UFUNC,
+                                                   ADDR_SHARED_BOOL_NATIVE, (void *)title_movie_passthrough};
+  if (!ufunc_swap_count)
+    return;
+  HANDLE h = CreateThread(NULL, 0, ufunc_watch, NULL, 0, NULL);
   if (h)
     CloseHandle(h);
   else
-    log_msg("offline login: CreateThread failed (%lu); online login unchanged", (unsigned long)GetLastError());
+    log_msg("ufunc swap: CreateThread failed (%lu); login and title unchanged", (unsigned long)GetLastError());
 }
 
 static void setup(void) {
@@ -3616,15 +4331,28 @@ static void setup(void) {
     return;
   }
   cfg_offline_login = env_int("SC6VRR_OFFLINE_LOGIN", 0);
-  log_msg("sc6vrr: offline_login=%d", cfg_offline_login);
-  if (cfg_offline_login)
-    start_offline_login();
+  cfg_skip_title = env_int("SC6VRR_SKIP_TITLE", 0);
+  log_msg("sc6vrr: offline_login=%d skip_title=%d", cfg_offline_login, cfg_skip_title);
+  start_ufunc_swaps();
+  if (env_int("SC6VRR_FAST_IMPORTS", 0))
+    install_fast_imports();
+  if (env_int("SC6VRR_FAST_LOCKS", 0))
+    install_fast_locks();
+  if (env_int("SC6VRR_FAST_CRT", 0))
+    install_fast_crt();
+  if (env_int("SC6VRR_COUNT_IMPORTS", 0))
+    install_import_counters();
   if (cfg_thread_names && !thread_name_observer)
     install_thread_name_observer();
   if (MH_Initialize() != MH_OK) {
     log_msg("sc6vrr: MH_Initialize failed");
     return;
   }
+  if (env_int("SC6VRR_TRACE_TITLE", 0))
+    install_title_trace();
+  if (env_int("SC6VRR_LOG_SCENES", 0) || env_int("SC6VRR_TRACE_TITLE", 0) || env_int("SC6VRR_COUNT_IMPORTS", 0) ||
+      cfg_skip_title == 2)
+    install_scene_log();
   cfg_block_query_wait = env_int("SC6VRR_BLOCK_QUERY_WAIT", 0);
   if (cfg_block_query_wait)
     install_query_wait();
@@ -3655,13 +4383,19 @@ static void setup(void) {
             cfg_skip_prepass);
   /* Frame-rate changes are switched off for now (2026-10-16). The engine hooks
    * below go in only with SC6VRR_FRAME_MODS=1, whatever the other settings say. */
-  if (!env_int("SC6VRR_FRAME_MODS", 0)) {
-    log_msg("sc6vrr: frame-rate modifications disabled; set SC6VRR_FRAME_MODS=1 to allow them");
-    return;
-  }
+  int frame_mods = env_int("SC6VRR_FRAME_MODS", 0);
   if (!bytes_match(ADDR(ADDR_GET_MAX_TICK_RATE), "40534883ec500f2974244048") ||
       !bytes_match(ADDR(ADDR_UPDATE_TIME), "40555357488d6c24b94881ec")) {
     log_msg("sc6vrr: engine function prologue mismatch; no hooks installed");
+    cfg_skip_title = 0; /* the title tick needs the UpdateTime hook */
+    return;
+  }
+  if (!frame_mods) {
+    log_msg("sc6vrr: frame-rate modifications disabled; set SC6VRR_FRAME_MODS=1 to allow them");
+    if (cfg_skip_title) {
+      MH_CreateHook(ADDR(ADDR_UPDATE_TIME), hook_update_time_tick, (void **)&orig_update_time);
+      log_msg("sc6vrr: UpdateTime hook for the title skip enabled (%d)", MH_EnableHook(ADDR(ADDR_UPDATE_TIME)));
+    }
     return;
   }
   MH_CreateHook(ADDR(ADDR_GET_MAX_TICK_RATE), hook_get_max_tick_rate, (void **)&orig_get_max_tick_rate);
@@ -3745,6 +4479,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     setup();
   } else if (reason == DLL_PROCESS_DETACH) {
     sample_stop = 1; /* the sampler writes its last file when it sees this */
+    ufunc_watch_stop = 1;
     if (thread_name_observer) {
       RemoveVectoredExceptionHandler(thread_name_observer);
       thread_name_observer = NULL;
