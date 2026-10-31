@@ -1558,6 +1558,7 @@ static void capture_sampler_state(const D3D11_SAMPLER_DESC *d, void *state) {
                            state, 0);
 }
 
+static int cfg_skip_prepass; /* SC6VRR_SKIP_PREPASS; explained where the prepass is skipped */
 typedef HRESULT(WINAPI *create_depth_state_fn)(void *self, const D3D11_DEPTH_STENCIL_DESC *desc, void **out);
 typedef HRESULT(WINAPI *create_raster_state_fn)(void *self, const D3D11_RASTERIZER_DESC *desc, void **out);
 typedef HRESULT(WINAPI *create_sampler_state_fn)(void *self, const D3D11_SAMPLER_DESC *desc, void **out);
@@ -1565,10 +1566,53 @@ static create_depth_state_fn orig_create_depth_state;
 static create_raster_state_fn orig_create_raster_state;
 static create_sampler_state_fn orig_create_sampler_state;
 
+/* Twins for the prepass skip (explained at SC6VRR_SKIP_PREPASS below). For
+ * every depth state that tests depth but does not write it, or tests "equal",
+ * a second state that writes depth is made when the game creates the first.
+ * The game's own states stay as they are, and the main pass binds a twin only
+ * on frames where the prepass was dropped, so the skip can be toggled while the
+ * game runs. The game uses reversed depth (near is 1.0, far is 0.0, the buffer
+ * clears to 0), so "equal" becomes "greater or equal" in the twin. */
+#define DEPTH_TWINS 256
+static void *depth_twin_orig[DEPTH_TWINS], *depth_twin_new[DEPTH_TWINS];
+static volatile LONG depth_twins;
+static SRWLOCK depth_twin_lock = SRWLOCK_INIT;
+
+static void *depth_twin(void *state) {
+  LONG n = InterlockedCompareExchange(&depth_twins, 0, 0); /* a full barrier: entries below n are written */
+  for (LONG i = 0; i < n; i++)
+    if (depth_twin_orig[i] == state)
+      return depth_twin_new[i];
+  return NULL;
+}
+
 static HRESULT WINAPI hook_create_depth_state(void *self, const D3D11_DEPTH_STENCIL_DESC *desc, void **out) {
   HRESULT hr = orig_create_depth_state(self, desc, out);
-  if (SUCCEEDED(hr) && out && *out)
-    capture_depth_state(desc, *out);
+  if (FAILED(hr) || !out || !*out || !desc)
+    return hr;
+  capture_depth_state(desc, *out);
+  if (!shader_dir[0] || !desc->DepthEnable ||
+      (desc->DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO && desc->DepthFunc != D3D11_COMPARISON_EQUAL))
+    return hr;
+  AcquireSRWLockExclusive(&depth_twin_lock);
+  LONG n = depth_twins;
+  if (!depth_twin(*out) && n < DEPTH_TWINS) {
+    D3D11_DEPTH_STENCIL_DESC t = *desc;
+    if (t.DepthFunc == D3D11_COMPARISON_EQUAL)
+      t.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    t.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    void *twin = NULL;
+    if (SUCCEEDED(orig_create_depth_state(self, &t, &twin)) && twin) {
+      depth_twin_orig[n] = *out;
+      depth_twin_new[n] = twin; /* kept for the whole run */
+      InterlockedExchange(&depth_twins, n + 1);
+      if (n < 24)
+        log_msg("prepass: depth twin %ld: func %d write %d stencil %d mask 0x%02x -> func %d write 1", n + 1,
+                (int)desc->DepthFunc, (int)desc->DepthWriteMask, (int)desc->StencilEnable,
+                (unsigned)desc->StencilWriteMask, (int)t.DepthFunc);
+    }
+  }
+  ReleaseSRWLockExclusive(&depth_twin_lock);
   return hr;
 }
 static HRESULT WINAPI hook_create_raster_state(void *self, const D3D11_RASTERIZER_DESC *desc, void **out) {
@@ -1639,9 +1683,21 @@ static void join_uints(char *out, size_t size, const UINT *values, UINT count, u
     snprintf(out, size, "none");
 }
 
+/* The per-pass GPU timer (SC6VRR_GPU_PASSES) is defined further down, after
+ * the context hooks it needs. These hooks call into it. */
+static int cfg_gpu_passes;
+static void *gpu_device, *gpu_ctx;
+static void gpu_pass_draw(void);
+static void gpu_pass_targets(void *ctx, UINT count, void *const *rtvs, void *dsv);
+static void gpu_pass_dispatch(void *ctx);
+static void gpu_pass_present(void);
+static void gpu_view_info(void *view, void **res, uint32_t *w, uint32_t *h, uint32_t *fmt);
+static void gpu_short_id(uint32_t id, char out[13]);
+
 /* Called on every draw. Only a combination not seen before costs more than
  * one hash probe; its IDs are written out as hashes. */
 static void note_draw(void) {
+  gpu_pass_draw();
   binding_key key;
   memcpy(&key, &bound, sizeof(key));
   for (int i = 0; i < STRIDE_SLOTS; i++)
@@ -1857,7 +1913,7 @@ enum {
   CTX_DRAW_AUTO, CTX_DRAW_INDEXED_INDIRECT, CTX_DRAW_INSTANCED_INDIRECT, CTX_CS_SET, CTX_PS_SRV, CTX_CS_SRV,
   CTX_CS_UAV, CTX_CLEAR_RTV, CTX_CLEAR_DSV, CTX_VIEWPORTS, CTX_DISPATCH, CTX_DISPATCH_INDIRECT, CTX_COPY_RESOURCE,
   CTX_COPY_REGION, CTX_RESOLVE, CTX_DEPTH_STATE, CTX_RASTER_STATE, CTX_VS_SRV, CTX_PS_SAMPLERS, CTX_VS_SAMPLERS,
-  CTX_CS_SAMPLERS, CTX_GET_DATA, CTX_MAP, CTX_FLUSH, CTX_COUNT
+  CTX_CS_SAMPLERS, CTX_GET_DATA, CTX_MAP, CTX_FLUSH, CTX_BEGIN, CTX_END, CTX_COUNT
 };
 static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(VSSetShader), CONTEXT_SLOT(GSSetShader), CONTEXT_SLOT(PSSetShader),
@@ -1872,7 +1928,7 @@ static const int kContextSlots[CTX_COUNT] = {
     CONTEXT_SLOT(CopySubresourceRegion), CONTEXT_SLOT(ResolveSubresource), CONTEXT_SLOT(OMSetDepthStencilState),
     CONTEXT_SLOT(RSSetState), CONTEXT_SLOT(VSSetShaderResources), CONTEXT_SLOT(PSSetSamplers),
     CONTEXT_SLOT(VSSetSamplers), CONTEXT_SLOT(CSSetSamplers), CONTEXT_SLOT(GetData), CONTEXT_SLOT(Map),
-    CONTEXT_SLOT(Flush)};
+    CONTEXT_SLOT(Flush), CONTEXT_SLOT(Begin), CONTEXT_SLOT(End)};
 static const char *const kContextNames[CTX_COUNT] = {
     "VSSetShader", "GSSetShader", "PSSetShader", "IASetInputLayout", "IASetPrimitiveTopology",
     "IASetVertexBuffers", "OMSetRenderTargets", "OMSetRenderTargetsAndUnorderedAccessViews", "OMSetBlendState",
@@ -1881,7 +1937,7 @@ static const char *const kContextNames[CTX_COUNT] = {
     "CSSetUnorderedAccessViews", "ClearRenderTargetView", "ClearDepthStencilView", "RSSetViewports", "Dispatch",
     "DispatchIndirect", "CopyResource", "CopySubresourceRegion", "ResolveSubresource", "OMSetDepthStencilState",
     "RSSetState", "VSSetShaderResources", "PSSetSamplers", "VSSetSamplers", "CSSetSamplers", "GetData", "Map",
-    "Flush"};
+    "Flush", "Begin", "End"};
 static void *orig_context[CTX_COUNT];
 
 /* Reads the formats of the bound views. A view's format can differ from its
@@ -1920,7 +1976,209 @@ static void note_targets(UINT count, void *const *rtvs, void *dsv) {
 static int cfg_skip_gs_draws;
 static uint64_t gs_draws_skipped;
 
+/* With SC6VRR_SKIP_PREPASS=1 the depth prepass is not drawn. The depth
+ * prepass is the pass that draws the opaque scene into the depth buffer only
+ * (no pixel shader, no color target) before the main scene pass, so that the
+ * main pass can skip hidden pixels. Apple GPUs remove hidden pixels in
+ * hardware, so the prepass is mostly wasted work there.
+ *
+ * What counts, per frame and per depth buffer:
+ * - A scene depth is a depth buffer that the game binds together with 4 or
+ *   more color targets (the G-buffer: the textures that hold the scene's
+ *   materials). The DLL learns them while the game runs, so other depth
+ *   buffers (custom depth, shadow maps) are never touched.
+ * - A depth-only pass on a scene depth before that buffer's main pass in the
+ *   frame is the prepass. Its draws without a pixel shader are dropped.
+ * - The main pass is the first G-buffer pass after a dropped prepass, and
+ *   later binds of the same targets in that frame. While it is bound, each
+ *   depth state is swapped for its twin that writes depth (see
+ *   hook_create_depth_state), because nothing else writes depth now.
+ * - Depth-only passes after the main pass are left alone, and so is every draw
+ *   inside an occlusion query (a query that counts the visible pixels of a
+ *   box, so the game can stop drawing hidden objects). The first versions
+ *   dropped those draws too. The queries then reported "hidden", and the game
+ *   stopped drawing whole objects (corrupt picture, 2026-10-31; probable cause,
+ *   not proven).
+ * F6 toggles the skip while the game runs, and so does a changed sc6vrr.ini.
+ * A change applies from the next frame. */
+typedef void(WINAPI *set_depth_state_fn)(void *ctx, void *state, UINT stencil_ref);
+#define SCENE_DEPTHS 8
+enum { DEPTH_FRESH, DEPTH_PREPASS, DEPTH_MAIN };
+static void *scene_depth[SCENE_DEPTHS], *scene_main_rt0[SCENE_DEPTHS];
+static UINT scene_main_count[SCENE_DEPTHS];
+static uint8_t scene_depth_state[SCENE_DEPTHS]; /* reset every frame */
+static unsigned scene_depths;
+static int prepass_state;      /* 1 while a prepass is bound: drop its depth-only draws */
+static int main_pass_active;   /* 1 while a main pass after a dropped prepass is bound */
+static int skip_this_frame;    /* cfg_skip_prepass, latched at Present */
+static void *prepass_ctx;      /* the context of the last targets call */
+static void *game_depth_state; /* the depth state the game bound last */
+#define OCCLUSION_MAX 16
+static void *occlusion_open[OCCLUSION_MAX];
+static int occlusion_active; /* occlusion queries begun and not yet ended */
+static uint64_t prepass_skipped, twin_binds, occlusion_draws_kept;
+
+static int scene_depth_find(void *res) {
+  for (unsigned i = 0; i < scene_depths; i++)
+    if (scene_depth[i] == res)
+      return (int)i;
+  return -1;
+}
+
+/* Runs before the game's targets call. Returns 1 when the main pass begins or
+ * ends, because the depth state must then be bound again after the call. */
+static int prepass_targets(void *ctx, UINT count, void *const *rtvs, void *dsv) {
+  int was_main = main_pass_active;
+  prepass_state = 0;
+  main_pass_active = 0;
+  if (!skip_this_frame)
+    return was_main;
+  prepass_ctx = ctx;
+  void *rtv0 = count && rtvs ? rtvs[0] : NULL;
+  void *res = NULL, *rt0 = NULL;
+  uint32_t w, h, fmt;
+  if (dsv)
+    gpu_view_info(dsv, &res, &w, &h, &fmt);
+  if (!res)
+    return was_main;
+  int i = scene_depth_find(res);
+  if (rtv0 && count >= 4) {
+    if (i < 0 && scene_depths < SCENE_DEPTHS) {
+      i = (int)scene_depths++;
+      scene_depth[i] = res;
+      scene_depth_state[i] = DEPTH_FRESH;
+      log_msg("prepass: scene depth %d is %ux%u", i + 1, w, h);
+    }
+    if (i >= 0) {
+      gpu_view_info(rtv0, &rt0, &w, &h, &fmt);
+      if (scene_depth_state[i] == DEPTH_PREPASS) {
+        scene_depth_state[i] = DEPTH_MAIN;
+        scene_main_rt0[i] = rt0;
+        scene_main_count[i] = count;
+        main_pass_active = 1;
+      } else if (scene_depth_state[i] == DEPTH_MAIN && scene_main_rt0[i] == rt0 && scene_main_count[i] == count) {
+        main_pass_active = 1;
+      }
+    }
+  } else if (!rtv0 && i >= 0 && scene_depth_state[i] != DEPTH_MAIN) {
+    scene_depth_state[i] = DEPTH_PREPASS;
+    prepass_state = 1;
+  }
+  return was_main != main_pass_active;
+}
+
+static void prepass_rebind(void *ctx) {
+  void *state = game_depth_state, *twin;
+  if (main_pass_active && (twin = depth_twin(state)))
+    state = twin;
+  ((set_depth_state_fn)orig_context[CTX_DEPTH_STATE])(ctx, state, bound_stencil_ref);
+}
+
+/* Occlusion queries. Begin takes any ID3D11Asynchronous; a query and a
+ * predicate both have ID3D11Query's GetDesc at the same place, and a counter's
+ * GetDesc fills a struct of the same size whose first value never equals an
+ * occlusion type, so no QueryInterface is needed. */
+typedef void(WINAPI *async_fn)(void *ctx, void *async);
+typedef void(WINAPI *query_desc_fn)(void *query, D3D11_QUERY_DESC *desc);
+static void WINAPI hook_query_begin(void *ctx, void *async) {
+  if (skip_this_frame && async && occlusion_active < OCCLUSION_MAX) {
+    D3D11_QUERY_DESC d = {0};
+    ((query_desc_fn)VTBL_METHOD(async, ID3D11Query, GetDesc))(async, &d);
+    if (d.Query == D3D11_QUERY_OCCLUSION || d.Query == D3D11_QUERY_OCCLUSION_PREDICATE)
+      for (int i = 0; i < OCCLUSION_MAX; i++)
+        if (!occlusion_open[i]) {
+          occlusion_open[i] = async;
+          occlusion_active++;
+          break;
+        }
+  }
+  ((async_fn)orig_context[CTX_BEGIN])(ctx, async);
+}
+static void WINAPI hook_query_end(void *ctx, void *async) {
+  if (occlusion_active)
+    for (int i = 0; i < OCCLUSION_MAX; i++)
+      if (occlusion_open[i] == async) {
+        occlusion_open[i] = NULL;
+        occlusion_active--;
+        break;
+      }
+  ((async_fn)orig_context[CTX_END])(ctx, async);
+}
+
+/* Live settings: F6 toggles the prepass skip, and a changed sc6vrr.ini is read
+ * again (checked once a second). Only the settings below change live. */
+static void live_reload(void) {
+  int skip = env_int("SC6VRR_SKIP_PREPASS", 0), gs = env_int("SC6VRR_SKIP_GS_DRAWS", 0);
+  if (skip && !shader_dir[0])
+    skip = 0;
+  float fps = (float)env_int("SC6VRR_MAX_FPS", 120);
+  log_msg("live: sc6vrr.ini changed: SC6VRR_SKIP_PREPASS %d -> %d, SC6VRR_SKIP_GS_DRAWS %d -> %d, "
+          "SC6VRR_MAX_FPS %.0f -> %.0f",
+          cfg_skip_prepass, skip, cfg_skip_gs_draws, gs, cfg_max_fps, fps);
+  cfg_skip_prepass = skip;
+  cfg_skip_gs_draws = gs;
+  cfg_max_fps = fps; /* read on every engine tick, so a plain store is enough */
+}
+
+static void prepass_present(void) {
+  static int f6_was_down;
+  static ULONGLONG next_check;
+  static FILETIME ini_time;
+  static unsigned frames;
+  int down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
+  if (down && !f6_was_down) {
+    if (shader_dir[0]) {
+      cfg_skip_prepass = !cfg_skip_prepass;
+      log_msg("live: F6: SC6VRR_SKIP_PREPASS=%d", cfg_skip_prepass);
+    } else {
+      log_msg("live: F6 ignored: the prepass skip needs SC6VRR_SHADER_DIR");
+    }
+  }
+  f6_was_down = down;
+  ULONGLONG now = GetTickCount64();
+  if (ini_path[0] && now >= next_check) {
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    next_check = now + 1000;
+    if (GetFileAttributesExA(ini_path, GetFileExInfoStandard, &a)) {
+      if ((ini_time.dwLowDateTime || ini_time.dwHighDateTime) && CompareFileTime(&a.ftLastWriteTime, &ini_time))
+        live_reload();
+      ini_time = a.ftLastWriteTime;
+    }
+  }
+  if (main_pass_active && prepass_ctx) {
+    main_pass_active = 0;
+    prepass_rebind(prepass_ctx);
+  }
+  prepass_state = 0;
+  skip_this_frame = cfg_skip_prepass;
+  for (unsigned i = 0; i < scene_depths; i++)
+    scene_depth_state[i] = DEPTH_FRESH;
+  memset(occlusion_open, 0, sizeof(occlusion_open));
+  occlusion_active = 0;
+  if (skip_this_frame && ++frames % 600 == 0)
+    log_msg("prepass: so far %llu draws dropped, %llu twin binds, %llu draws kept inside occlusion queries",
+            (unsigned long long)prepass_skipped, (unsigned long long)twin_binds,
+            (unsigned long long)occlusion_draws_kept);
+}
+
+/* Draws are timed when the GPU timer is on; a draw that takes long on the
+ * calling thread (for example one that waits for a pipeline to compile) is
+ * logged with its shaders. */
+#define SLOW_DRAW_MS 2.0
+static unsigned slow_draws_logged;
+static double slow_draw_begin(void);
+static void slow_draw_end(double t0, const char *what);
+
 static int skip_gs_draw(void) {
+  if (prepass_state && bound.ps == ID_NONE) {
+    if (occlusion_active) {
+      occlusion_draws_kept++;
+    } else {
+      if (++prepass_skipped == 1)
+        log_msg("prepass: dropping depth-only draws of the prepass (SC6VRR_SKIP_PREPASS=1)");
+      return 1;
+    }
+  }
   if (!cfg_skip_gs_draws || bound.gs == ID_NONE)
     return 0;
   if (++gs_draws_skipped == 1)
@@ -1970,14 +2228,21 @@ static void log_targets(const char *call, UINT count, void *const *rtvs, void *d
 }
 
 static void WINAPI hook_targets_set(void *ctx, UINT count, void *const *rtvs, void *dsv) {
+  gpu_pass_targets(ctx, count, rtvs, dsv);
+  int rebind = prepass_targets(ctx, count, rtvs, dsv);
   note_targets(count, rtvs, dsv);
   if (FRAME_LOGGING_NOW)
     log_targets("OMSetRenderTargets", count, rtvs, dsv);
   ((set_targets_fn)orig_context[CTX_TARGETS])(ctx, count, rtvs, dsv);
+  if (rebind)
+    prepass_rebind(ctx);
 }
 static void WINAPI hook_targets_uavs_set(void *ctx, UINT count, void *const *rtvs, void *dsv, UINT uav_start,
                                          UINT uav_count, void *const *uavs, const UINT *initial_counts) {
+  int rebind = 0;
   if (count != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL) {
+    gpu_pass_targets(ctx, count, rtvs, dsv);
+    rebind = prepass_targets(ctx, count, rtvs, dsv);
     note_targets(count, rtvs, dsv);
     if (FRAME_LOGGING_NOW)
       log_targets("OMSetRenderTargetsAndUnorderedAccessViews", count, rtvs, dsv);
@@ -1986,6 +2251,8 @@ static void WINAPI hook_targets_uavs_set(void *ctx, UINT count, void *const *rtv
     describe_views("OMSetUnorderedAccessViews", uav_start, uav_count, uavs);
   ((set_targets_uavs_fn)orig_context[CTX_TARGETS_UAVS])(ctx, count, rtvs, dsv, uav_start, uav_count, uavs,
                                                         initial_counts);
+  if (rebind)
+    prepass_rebind(ctx);
 }
 static void WINAPI hook_blend_set(void *ctx, void *state, const FLOAT factor[4], UINT sample_mask) {
   bound.blend = object_lookup(state, NULL);
@@ -2000,7 +2267,9 @@ static void WINAPI hook_draw(void *ctx, UINT count, UINT start) {
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_fn)orig_context[CTX_DRAW])(ctx, count, start);
+  slow_draw_end(t0_, "DRAW");
 }
 static void WINAPI hook_draw_indexed(void *ctx, UINT count, UINT start, INT base) {
   note_draw();
@@ -2011,7 +2280,9 @@ static void WINAPI hook_draw_indexed(void *ctx, UINT count, UINT start, INT base
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_indexed_fn)orig_context[CTX_DRAW_INDEXED])(ctx, count, start, base);
+  slow_draw_end(t0_, "DRAW_INDEXED");
 }
 static void WINAPI hook_draw_indexed_instanced(void *ctx, UINT count, UINT instances, UINT start, INT base,
                                                UINT start_instance) {
@@ -2023,8 +2294,10 @@ static void WINAPI hook_draw_indexed_instanced(void *ctx, UINT count, UINT insta
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_indexed_instanced_fn)orig_context[CTX_DRAW_INDEXED_INSTANCED])(ctx, count, instances, start, base,
                                                                         start_instance);
+  slow_draw_end(t0_, "DRAW_INDEXED_INSTANCED");
 }
 static void WINAPI hook_draw_instanced(void *ctx, UINT count, UINT instances, UINT start, UINT start_instance) {
   note_draw();
@@ -2035,7 +2308,9 @@ static void WINAPI hook_draw_instanced(void *ctx, UINT count, UINT instances, UI
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_instanced_fn)orig_context[CTX_DRAW_INSTANCED])(ctx, count, instances, start, start_instance);
+  slow_draw_end(t0_, "DRAW_INSTANCED");
 }
 static void WINAPI hook_draw_auto(void *ctx) {
   note_draw();
@@ -2046,7 +2321,9 @@ static void WINAPI hook_draw_auto(void *ctx) {
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_auto_fn)orig_context[CTX_DRAW_AUTO])(ctx);
+  slow_draw_end(t0_, "DRAW_AUTO");
 }
 static void WINAPI hook_draw_indexed_indirect(void *ctx, void *args, UINT offset) {
   note_draw();
@@ -2057,7 +2334,9 @@ static void WINAPI hook_draw_indexed_indirect(void *ctx, void *args, UINT offset
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_indirect_fn)orig_context[CTX_DRAW_INDEXED_INDIRECT])(ctx, args, offset);
+  slow_draw_end(t0_, "DRAW_INDEXED_INDIRECT");
 }
 static void WINAPI hook_draw_instanced_indirect(void *ctx, void *args, UINT offset) {
   note_draw();
@@ -2068,7 +2347,9 @@ static void WINAPI hook_draw_instanced_indirect(void *ctx, void *args, UINT offs
   }
   if (skip_gs_draw())
     return;
+  double t0_ = slow_draw_begin();
   ((draw_indirect_fn)orig_context[CTX_DRAW_INSTANCED_INDIRECT])(ctx, args, offset);
+  slow_draw_end(t0_, "DRAW_INSTANCED_INDIRECT");
 }
 
 
@@ -2127,6 +2408,7 @@ static void WINAPI hook_viewports_set(void *ctx, UINT count, const D3D11_VIEWPOR
   ((set_viewports_fn)orig_context[CTX_VIEWPORTS])(ctx, count, v);
 }
 static void WINAPI hook_dispatch(void *ctx, UINT x, UINT y, UINT z) {
+  gpu_pass_dispatch(ctx);
   if (FRAME_LOGGING_NOW) {
     char cs[65];
     short_id(bound_cs, cs);
@@ -2171,13 +2453,18 @@ static void WINAPI hook_resolve(void *ctx, void *dst, UINT dst_sub, void *src, U
   ((resolve_fn)orig_context[CTX_RESOLVE])(ctx, dst, dst_sub, src, src_sub, format);
 }
 
-typedef void(WINAPI *set_depth_state_fn)(void *ctx, void *state, UINT stencil_ref);
 typedef void(WINAPI *set_raster_state_fn)(void *ctx, void *state);
 typedef void(WINAPI *set_samplers_fn)(void *ctx, UINT start, UINT count, void *const *samplers);
 
 static void WINAPI hook_depth_state_set(void *ctx, void *state, UINT stencil_ref) {
   bound_depth_state = object_lookup(state, NULL);
   bound_stencil_ref = stencil_ref;
+  game_depth_state = state;
+  void *twin;
+  if (main_pass_active && (twin = depth_twin(state))) {
+    state = twin;
+    twin_binds++;
+  }
   ((set_depth_state_fn)orig_context[CTX_DEPTH_STATE])(ctx, state, stencil_ref);
 }
 static void WINAPI hook_raster_state_set(void *ctx, void *state) {
@@ -2301,6 +2588,538 @@ static void WINAPI hook_flush(void *ctx) {
   ((flush_fn)orig_context[CTX_FLUSH])(ctx);
 }
 
+/* ---------- per-pass GPU timer (SC6VRR_GPU_PASSES) ------------------------ */
+
+/* A "pass" here is a run of calls between two changes of the render target.
+ * Draws are one kind of pass. A run of compute dispatches is another. At each
+ * boundary the timer asks the GPU for a timestamp (an ID3D11Query of type
+ * D3D11_QUERY_TIMESTAMP). The cost of a pass is the difference between its two
+ * timestamps. The results arrive a few frames later, so the timer keeps a ring
+ * of frames and reads each frame's queries once the GPU has finished them.
+ *
+ * Needs the DXMT build whose timestamps come from a GPU counter sample buffer
+ * (TimestampReadbackSBuf). The stock build gives every timestamp in a Metal
+ * command buffer the same value. Each timestamp also splits the Metal pass and
+ * forces a flush, so the timer slows the game and moves some cost around. Use
+ * it to rank passes, not to predict the frame rate.
+ *
+ * Work that sits between two boundaries (clears, copies) is charged to the pass
+ * before it. The immediate context is used from one thread, so no lock is
+ * needed. Needs SC6VRR_SHADER_DIR, so that shader IDs exist. */
+#define GPU_MAX_PASSES 300
+#define GPU_RING 8
+#define GPU_MIN_AGE 3  /* frames to wait before the first read */
+#define GPU_MAX_AGE 12 /* frames after which an unfinished frame is dropped */
+#define GPU_AGG_SLOTS 1024
+#define GPU_DUMP_SECONDS 10.0
+
+typedef HRESULT(WINAPI *create_query_fn)(void *device, const D3D11_QUERY_DESC *desc, void **query);
+typedef void(WINAPI *get_device_fn)(void *child, void **device);
+typedef void(WINAPI *end_fn)(void *ctx, void *async);
+
+enum { GPU_PASS_DRAW, GPU_PASS_CS };
+typedef struct {
+  void *rtv0, *dsv_view;     /* the views last seen, to skip repeated sets */
+  void *rt0_res, *dsv_res;   /* the textures behind them: the pass identity */
+  uint32_t type, rt_count, draws, ps, vs, cs;
+  uint32_t w, h, fmt, dw, dh;
+} gpu_pass;
+typedef struct {
+  gpu_pass pass[GPU_MAX_PASSES];
+  void *query[GPU_MAX_PASSES + 1];
+  uint64_t ts[GPU_MAX_PASSES + 1];
+  uint8_t got[GPU_MAX_PASSES + 1];
+  uint32_t npass;   /* closed passes; pass[npass] is the open one if `open` */
+  uint32_t nquery;  /* timestamps issued; a frame with n passes has n + 1 */
+  uint32_t nread;
+  int open, done, age;
+  double wall_start, wall;
+} gpu_frame;
+static gpu_frame gpu_frames[GPU_RING];
+static int gpu_cur, gpu_started;
+static char gpu_path[MAX_PATH];
+
+typedef struct {
+  uint64_t key, n, draws;
+  double ticks;
+  uint32_t type, rt_count, ps, vs, cs, w, h, fmt, dw, dh, first_order;
+} gpu_agg;
+static gpu_agg gpu_aggs[GPU_AGG_SLOTS];
+static size_t gpu_agg_count;
+static double gpu_ticks_total, gpu_wall_total, gpu_next_dump;
+static uint64_t gpu_frames_read, gpu_frames_dropped, gpu_frames_total;
+static int gpu_reset_was_down;
+
+/* The slowest frames, each with its full pass list, so that rare heavy frames
+ * (for example a super move) are not lost in the averages. Frames over
+ * GPU_WORST_MAX_MS are skipped: those are load hitches, not heavy scenes. */
+#define GPU_WORST 6
+#define GPU_WORST_MAX_MS 32.0
+#define GPU_HITCH_MS 22.0 /* frames slower than this are logged one by one */
+typedef struct {
+  double total;             /* raw timestamp units; 0 = empty slot */
+  uint32_t n;
+  gpu_pass pass[GPU_MAX_PASSES];
+  double d[GPU_MAX_PASSES]; /* raw units per pass */
+} gpu_worst_frame;
+static gpu_worst_frame gpu_worst[GPU_WORST];
+static char gpu_worst_path[MAX_PATH];
+
+static void gpu_view_info(void *view, void **res, uint32_t *w, uint32_t *h, uint32_t *fmt) {
+  *res = NULL;
+  *w = *h = *fmt = 0;
+  if (!view)
+    return;
+  void *resource = NULL;
+  ((get_resource_fn)VTBL_METHOD(view, ID3D11View, GetResource))(view, &resource);
+  if (!resource)
+    return;
+  D3D11_RESOURCE_DIMENSION type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+  ((get_type_fn)VTBL_METHOD(resource, ID3D11Resource, GetType))(resource, &type);
+  if (type == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+    D3D11_TEXTURE2D_DESC d;
+    ((texture2d_desc_fn)VTBL_METHOD(resource, ID3D11Texture2D, GetDesc))(resource, &d);
+    *w = d.Width;
+    *h = d.Height;
+    *fmt = (uint32_t)d.Format;
+  }
+  *res = resource; /* only compared, never used again */
+  ((com_release_fn)VTBL_METHOD(resource, ID3D11Resource, Release))(resource);
+}
+
+/* Issues one timestamp for the frame; returns 0 if it could not. */
+static int gpu_stamp(void *ctx, gpu_frame *fr) {
+  if (fr->nquery >= GPU_MAX_PASSES + 1)
+    return 0;
+  uint32_t i = fr->nquery;
+  if (!fr->query[i]) {
+    D3D11_QUERY_DESC desc = {D3D11_QUERY_TIMESTAMP, 0};
+    void *query = NULL;
+    if (FAILED(((create_query_fn)VTBL_METHOD(gpu_device, ID3D11Device, CreateQuery))(gpu_device, &desc, &query)) ||
+        !query)
+      return 0;
+    fr->query[i] = query;
+  }
+  ((end_fn)VTBL_METHOD(ctx, ID3D11DeviceContext, End))(ctx, fr->query[i]);
+  fr->nquery++;
+  return 1;
+}
+
+static void gpu_close_pass(void *ctx, gpu_frame *fr) {
+  if (!fr->open)
+    return;
+  if (gpu_stamp(ctx, fr))
+    fr->npass++;
+  fr->open = 0;
+}
+
+static gpu_pass *gpu_open_pass(void *ctx, gpu_frame *fr, uint32_t type) {
+  /* A full frame keeps its last pass open, which then absorbs the rest. */
+  if (fr->npass >= GPU_MAX_PASSES - 1)
+    return fr->open ? &fr->pass[fr->npass] : NULL;
+  gpu_close_pass(ctx, fr);
+  gpu_pass *p = &fr->pass[fr->npass];
+  memset(p, 0, sizeof(*p));
+  p->type = type;
+  fr->open = 1;
+  return p;
+}
+
+static void gpu_frame_begin(void *ctx, gpu_frame *fr) {
+  fr->npass = fr->nquery = fr->nread = 0;
+  fr->open = fr->done = fr->age = 0;
+  memset(fr->got, 0, sizeof(fr->got));
+  fr->wall_start = qpc_seconds();
+  gpu_stamp(ctx, fr); /* timestamp 0 starts the first pass */
+}
+
+static void gpu_pass_draw(void) {
+  if (!cfg_gpu_passes || !gpu_started)
+    return;
+  gpu_frame *fr = &gpu_frames[gpu_cur];
+  if (!fr->open || fr->pass[fr->npass].type != GPU_PASS_DRAW)
+    return;
+  gpu_pass *p = &fr->pass[fr->npass];
+  if (!p->draws++) {
+    p->ps = bound.ps;
+    p->vs = bound.vs;
+  }
+}
+
+/* The game may create a short-lived device before the real one, so the
+ * context and device come from live hook calls, never from device creation. */
+static void gpu_pass_targets(void *ctx, UINT count, void *const *rtvs, void *dsv) {
+  if (!cfg_gpu_passes)
+    return;
+  gpu_ctx = ctx;
+  if (!gpu_started)
+    return;
+  void *rtv0 = count && rtvs ? rtvs[0] : NULL;
+  if (!rtv0 && !dsv)
+    return; /* unbinding everything is not a new pass */
+  gpu_frame *fr = &gpu_frames[gpu_cur];
+  gpu_pass *cur = fr->open ? &fr->pass[fr->npass] : NULL;
+  if (cur && cur->type == GPU_PASS_DRAW && cur->rtv0 == rtv0 && cur->dsv_view == dsv)
+    return;
+  void *rt_res, *ds_res;
+  uint32_t w, h, fmt, dw, dh, dfmt;
+  gpu_view_info(rtv0, &rt_res, &w, &h, &fmt);
+  gpu_view_info(dsv, &ds_res, &dw, &dh, &dfmt);
+  int same = cur && cur->type == GPU_PASS_DRAW &&
+             (cfg_gpu_passes >= 2 ? (cur->w == w && cur->h == h && cur->fmt == fmt && cur->dw == dw &&
+                                     cur->dh == dh && cur->rt_count == count)
+                                  : (cur->rt0_res == rt_res && cur->dsv_res == ds_res));
+  if (same) {
+    cur->rtv0 = rtv0; /* another view of the same textures: the same pass */
+    cur->dsv_view = dsv;
+    return;
+  }
+  gpu_pass *p = gpu_open_pass(ctx, fr, GPU_PASS_DRAW);
+  if (!p || p == cur)
+    return;
+  p->rtv0 = rtv0;
+  p->dsv_view = dsv;
+  p->rt0_res = rt_res;
+  p->dsv_res = ds_res;
+  p->rt_count = count;
+  p->w = w;
+  p->h = h;
+  p->fmt = fmt;
+  p->dw = dw;
+  p->dh = dh;
+}
+
+static void gpu_pass_dispatch(void *ctx) {
+  if (!cfg_gpu_passes)
+    return;
+  gpu_ctx = ctx;
+  if (!gpu_started)
+    return;
+  gpu_frame *fr = &gpu_frames[gpu_cur];
+  gpu_pass *cur = fr->open ? &fr->pass[fr->npass] : NULL;
+  if (cur && cur->type == GPU_PASS_CS) {
+    cur->draws++;
+    return;
+  }
+  gpu_pass *p = gpu_open_pass(ctx, fr, GPU_PASS_CS);
+  if (p && p != cur) {
+    p->cs = bound_cs;
+    p->draws = 1;
+  }
+}
+
+static uint64_t gpu_key(const gpu_pass *p) {
+  uint32_t k[12] = {p->type, p->rt_count, p->ps, p->vs, p->cs, p->w, p->h, p->fmt, p->dw, p->dh, 0, 0};
+  return fnv1a(k, sizeof(k));
+}
+
+static void gpu_short_id(uint32_t id, char out[13]);
+
+static void gpu_accumulate(gpu_frame *fr) {
+  double total = 0;
+  static double dd[GPU_MAX_PASSES];
+  for (uint32_t i = 0; i < fr->npass; i++) {
+    const gpu_pass *p = &fr->pass[i];
+    uint64_t t0 = fr->ts[i], t1 = fr->ts[i + 1];
+    double d = t1 > t0 ? (double)(t1 - t0) : 0.0; /* timestamps must not go backward */
+    dd[i] = d;
+    total += d;
+    uint64_t key = gpu_key(p);
+    gpu_agg *a = NULL;
+    for (size_t j = key & (GPU_AGG_SLOTS - 1), tries = 0; tries < GPU_AGG_SLOTS; j = (j + 1) & (GPU_AGG_SLOTS - 1), tries++) {
+      if (gpu_aggs[j].n && gpu_aggs[j].key == key) {
+        a = &gpu_aggs[j];
+        break;
+      }
+      if (!gpu_aggs[j].n && gpu_agg_count < GPU_AGG_SLOTS / 4 * 3) {
+        a = &gpu_aggs[j];
+        memset(a, 0, sizeof(*a));
+        a->key = key;
+        a->type = p->type;
+        a->rt_count = p->rt_count;
+        a->ps = p->ps;
+        a->vs = p->vs;
+        a->cs = p->cs;
+        a->w = p->w;
+        a->h = p->h;
+        a->fmt = p->fmt;
+        a->dw = p->dw;
+        a->dh = p->dh;
+        a->first_order = i;
+        gpu_agg_count++;
+        break;
+      }
+    }
+    if (!a)
+      continue;
+    a->n++;
+    a->draws += p->draws;
+    a->ticks += d;
+  }
+  gpu_ticks_total += total;
+  gpu_wall_total += fr->wall;
+  gpu_frames_read++;
+  /* One log line per slow frame, so hitches can be lined up with what happened
+   * in the game. The longest pass tells whether the GPU worked or sat idle:
+   * a pass with no draws that takes many milliseconds is a gap. */
+  static unsigned hitches_logged;
+  if (fr->wall * 1000.0 > GPU_HITCH_MS && hitches_logged < 300) {
+    uint32_t longest = 0;
+    for (uint32_t i = 1; i < fr->npass; i++)
+      if (dd[i] > dd[longest])
+        longest = i;
+    char ps[13] = "none", vs[13] = "none";
+    if (fr->npass) {
+      gpu_short_id(fr->pass[longest].ps, ps);
+      gpu_short_id(fr->pass[longest].vs, vs);
+    }
+    log_msg("gpu hitch %u: frame %.1f ms, GPU %.1f ms, %u passes; longest pass #%u %.1f ms (%u draws, %ux%u, ps %s, vs %s)",
+            ++hitches_logged, fr->wall * 1000.0, total * 1e-6, fr->npass, longest, fr->npass ? dd[longest] * 1e-6 : 0.0,
+            fr->npass ? fr->pass[longest].draws : 0, fr->npass ? fr->pass[longest].w : 0,
+            fr->npass ? fr->pass[longest].h : 0, ps, vs);
+  }
+  /* Compare in wall time: the units are close to nanoseconds, but the wall
+   * time does not depend on that. */
+  if (fr->wall * 1000.0 <= GPU_WORST_MAX_MS) {
+    gpu_worst_frame *slot = &gpu_worst[0];
+    for (int i = 1; i < GPU_WORST; i++)
+      if (gpu_worst[i].total < slot->total)
+        slot = &gpu_worst[i];
+    if (total > slot->total) {
+      slot->total = total;
+      slot->n = fr->npass;
+      memcpy(slot->pass, fr->pass, fr->npass * sizeof(gpu_pass));
+      memcpy(slot->d, dd, fr->npass * sizeof(double));
+    }
+  }
+}
+
+/* Reads the queries of every finished frame. A frame is used only if all of its
+ * timestamps are ready; one that is not ready after GPU_MAX_AGE frames is dropped. */
+static void gpu_harvest(void *ctx) {
+  for (int k = 0; k < GPU_RING; k++) {
+    gpu_frame *fr = &gpu_frames[k];
+    if (!fr->done || k == gpu_cur)
+      continue;
+    if (++fr->age < GPU_MIN_AGE)
+      continue;
+    for (uint32_t i = 0; i < fr->nquery; i++) {
+      if (fr->got[i])
+        continue;
+      uint64_t value = 0;
+      HRESULT hr = ((get_data_fn)orig_context[CTX_GET_DATA])(ctx, fr->query[i], &value, sizeof(value),
+                                                            D3D11_ASYNC_GETDATA_DONOTFLUSH);
+      if (hr != S_OK)
+        break; /* the later timestamps cannot be ready before this one */
+      fr->ts[i] = value;
+      fr->got[i] = 1;
+      fr->nread++;
+    }
+    if (fr->nread == fr->nquery) {
+      if (fr->npass)
+        gpu_accumulate(fr);
+      fr->done = 0;
+    } else if (fr->age > GPU_MAX_AGE) {
+      gpu_frames_dropped++;
+      fr->done = 0;
+    }
+  }
+}
+
+static void gpu_short_id(uint32_t id, char out[13]) {
+  char hex[65];
+  id_hex(id, hex);
+  memcpy(out, hex, 12);
+  out[12] = 0;
+  if (strlen(hex) < 12)
+    snprintf(out, 13, "%s", hex);
+}
+
+static double slow_draw_begin(void) { return cfg_gpu_passes ? qpc_seconds() : 0.0; }
+static void slow_draw_end(double t0, const char *what) {
+  if (!t0)
+    return;
+  double ms = (qpc_seconds() - t0) * 1000.0;
+  if (ms < SLOW_DRAW_MS || slow_draws_logged >= 300)
+    return;
+  char ps[13], vs[13];
+  gpu_short_id(bound.ps, ps);
+  gpu_short_id(bound.vs, vs);
+  log_msg("slow draw %u: %s took %.1f ms on the calling thread (ps %s, vs %s, %u render targets)", ++slow_draws_logged,
+          what, ms, ps, vs, bound.rt_count);
+}
+
+static int gpu_agg_cmp(const void *a, const void *b) {
+  double x = ((const gpu_agg *)a)->ticks, y = ((const gpu_agg *)b)->ticks;
+  return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void gpu_dump(void) {
+  if (!gpu_frames_read || !gpu_path[0])
+    return;
+  static gpu_agg sorted[GPU_AGG_SLOTS];
+  size_t n = 0;
+  for (size_t i = 0; i < GPU_AGG_SLOTS; i++)
+    if (gpu_aggs[i].n)
+      sorted[n++] = gpu_aggs[i];
+  qsort(sorted, n, sizeof(sorted[0]), gpu_agg_cmp);
+  /* Seconds per timestamp unit, assuming the GPU is busy for the whole frame
+   * (true when the frame is GPU-bound, which was measured for battle). */
+  double frames = (double)gpu_frames_read;
+  double k = gpu_ticks_total > 0 ? gpu_wall_total / gpu_ticks_total : 0;
+  FILE *f = fopen(gpu_path, "w");
+  if (!f)
+    return;
+  fprintf(f, "# GPU time per pass, averaged over %llu frames (%llu dropped, %llu frames seen)\n",
+          (unsigned long long)gpu_frames_read, (unsigned long long)gpu_frames_dropped,
+          (unsigned long long)gpu_frames_total);
+  fprintf(f, "# wall_ms_per_frame=%.3f raw_units_per_frame=%.1f seconds_per_raw_unit=%.6g (ms = raw * this; "
+             "raw is nanoseconds if this is near 1e-9)\n",
+          gpu_wall_total / frames * 1000.0, gpu_ticks_total / frames, k);
+  fprintf(f, "# The timer splits every pass with a timestamp, so frames run slower than normal and "
+             "cost moves between passes. Rank with it; do not add the milliseconds up as a frame time.\n");
+  /* The timer's own cost: a pass with at most 2 draws that happens in most
+   * frames does almost no GPU work, so its time is mostly the split itself. */
+  double floors[GPU_AGG_SLOTS];
+  size_t nf = 0;
+  double passes_per_frame = 0;
+  for (size_t i = 0; i < n; i++) {
+    passes_per_frame += (double)sorted[i].n / frames;
+    if ((double)sorted[i].n / frames >= 0.5 && (double)sorted[i].draws / (double)sorted[i].n <= 2.0)
+      floors[nf++] = sorted[i].ticks * k / (double)sorted[i].n * 1000.0;
+  }
+  double floor_ms = 0;
+  if (nf) {
+    for (size_t i = 1; i < nf; i++)
+      for (size_t j = i; j > 0 && floors[j - 1] > floors[j]; j--) {
+        double t = floors[j]; floors[j] = floors[j - 1]; floors[j - 1] = t;
+      }
+    floor_ms = floors[nf / 2];
+  }
+  fprintf(f, "# passes_per_frame=%.1f; small passes cost about %.3f ms each, so roughly %.1f ms of every frame "
+             "is the timer itself\n", passes_per_frame, floor_ms, passes_per_frame * floor_ms);
+  fprintf(f, "rank\tshare_pct\tms_per_frame\tpasses_per_frame\tdraws_per_pass\ttype\trt0\tdepth\tps\tvs\tcs\tfirst_order\n");
+  for (size_t i = 0; i < n; i++) {
+    const gpu_agg *a = &sorted[i];
+    char ps[13], vs[13], cs[13], rt[48], ds[32];
+    gpu_short_id(a->ps, ps);
+    gpu_short_id(a->vs, vs);
+    gpu_short_id(a->cs, cs);
+    snprintf(rt, sizeof(rt), "%ux%u:f%u:x%u", a->w, a->h, a->fmt, a->rt_count);
+    snprintf(ds, sizeof(ds), "%ux%u", a->dw, a->dh);
+    fprintf(f, "%zu\t%.2f\t%.3f\t%.2f\t%.1f\t%s\t%s\t%s\t%s\t%s\t%s\t%u\n", i + 1,
+            gpu_ticks_total > 0 ? 100.0 * a->ticks / gpu_ticks_total : 0.0, a->ticks * k / frames * 1000.0,
+            (double)a->n / frames, (double)a->draws / (double)a->n, a->type == GPU_PASS_CS ? "cs" : "draw", rt, ds,
+            ps, vs, cs, a->first_order);
+  }
+  fclose(f);
+  if (gpu_worst_path[0]) {
+    FILE *w = fopen(gpu_worst_path, "w");
+    if (w) {
+      fprintf(w, "# The %d slowest frames since the last F9 (frames over %.0f ms are skipped). Passes in frame order.\n",
+              GPU_WORST, GPU_WORST_MAX_MS);
+      fprintf(w, "frame\ttotal_ms\torder\tms\ttype\trt0\tdepth\tps\tvs\tcs\tdraws\n");
+      int order[GPU_WORST];
+      for (int i = 0; i < GPU_WORST; i++)
+        order[i] = i;
+      for (int i = 1; i < GPU_WORST; i++)
+        for (int j = i; j > 0 && gpu_worst[order[j - 1]].total < gpu_worst[order[j]].total; j--) {
+          int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
+        }
+      for (int r = 0; r < GPU_WORST; r++) {
+        const gpu_worst_frame *wf = &gpu_worst[order[r]];
+        if (!wf->n)
+          continue;
+        for (uint32_t i = 0; i < wf->n; i++) {
+          const gpu_pass *p = &wf->pass[i];
+          char ps[13], vs[13], cs[13], rt[48], ds[32];
+          gpu_short_id(p->ps, ps);
+          gpu_short_id(p->vs, vs);
+          gpu_short_id(p->cs, cs);
+          snprintf(rt, sizeof(rt), "%ux%u:f%u:x%u", p->w, p->h, p->fmt, p->rt_count);
+          snprintf(ds, sizeof(ds), "%ux%u", p->dw, p->dh);
+          fprintf(w, "%d\t%.3f\t%u\t%.3f\t%s\t%s\t%s\t%s\t%s\t%s\t%u\n", r + 1, wf->total * k * 1000.0, i,
+                  wf->d[i] * k * 1000.0, p->type == GPU_PASS_CS ? "cs" : "draw", rt, ds, ps, vs, cs, p->draws);
+        }
+      }
+      fclose(w);
+    }
+  }
+  log_msg("gpu passes: %llu frames, wall %.2f ms/frame, raw %.0f units/frame (k=%.4g), %llu dropped, written to %s",
+          (unsigned long long)gpu_frames_read, gpu_wall_total / frames * 1000.0, gpu_ticks_total / frames, k,
+          (unsigned long long)gpu_frames_dropped, gpu_path);
+}
+
+/* Called at every Present, before the real one. */
+static void gpu_pass_present(void) {
+  if (!cfg_gpu_passes || !gpu_ctx)
+    return;
+  void *ctx = gpu_ctx;
+  if (!gpu_device) {
+    ((get_device_fn)VTBL_METHOD(ctx, ID3D11DeviceChild, GetDevice))(ctx, &gpu_device);
+    if (!gpu_device)
+      return;
+    /* GetDevice added a reference; keep it, because the timer uses the device
+     * for the rest of the run. */
+  }
+  double now = qpc_seconds();
+  if (gpu_started) {
+    gpu_frame *fr = &gpu_frames[gpu_cur];
+    gpu_close_pass(ctx, fr);
+    fr->wall = now - fr->wall_start;
+    fr->done = 1;
+    gpu_frames_total++;
+  }
+  int reset_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+  if (reset_down && !gpu_reset_was_down) {
+    memset(gpu_aggs, 0, sizeof(gpu_aggs));
+    memset(gpu_worst, 0, sizeof(gpu_worst));
+    gpu_agg_count = 0;
+    gpu_ticks_total = gpu_wall_total = 0;
+    gpu_frames_read = gpu_frames_dropped = gpu_frames_total = 0;
+    log_msg("gpu passes: counts cleared (F9)");
+  }
+  gpu_reset_was_down = reset_down;
+  gpu_harvest(ctx);
+  gpu_cur = (gpu_cur + 1) % GPU_RING;
+  gpu_frame *fr = &gpu_frames[gpu_cur];
+  if (fr->done)
+    gpu_frames_dropped++; /* the ring wrapped before this frame was read */
+  gpu_frame_begin(ctx, fr);
+  gpu_started = 1;
+  if (now >= gpu_next_dump) {
+    if (gpu_next_dump)
+      gpu_dump();
+    gpu_next_dump = now + GPU_DUMP_SECONDS;
+  }
+}
+
+static void gpu_pass_setup(void) {
+  cfg_gpu_passes = env_int("SC6VRR_GPU_PASSES", 0);
+  if (!cfg_gpu_passes)
+    return;
+  if (!shader_dir[0]) {
+    log_msg("gpu passes: needs SC6VRR_SHADER_DIR (the hooks that give shaders their IDs); timer off");
+    cfg_gpu_passes = 0;
+    return;
+  }
+  if (!cfg_str("SC6VRR_GPU_FILE", gpu_path, sizeof(gpu_path))) {
+    DWORD n = GetModuleFileNameA(NULL, gpu_path, sizeof(gpu_path));
+    char *slash = (n && n < sizeof(gpu_path)) ? strrchr(gpu_path, '\\') : NULL;
+    if (!slash || (size_t)(slash + 1 - gpu_path) + sizeof("sc6vrr-gpu-passes.tsv") > sizeof(gpu_path)) {
+      log_msg("gpu passes: no output path; timer off");
+      cfg_gpu_passes = 0;
+      return;
+    }
+    strcpy(slash + 1, "sc6vrr-gpu-passes.tsv");
+  }
+  size_t len = strlen(gpu_path);
+  if (len > 4 && len + 8 < sizeof(gpu_worst_path) && !strcmp(gpu_path + len - 4, ".tsv"))
+    snprintf(gpu_worst_path, sizeof(gpu_worst_path), "%.*s-worst.tsv", (int)(len - 4), gpu_path);
+  log_msg("gpu passes: on (mode %d), output %s, slowest frames in %s, F9 clears the counts", cfg_gpu_passes,
+          gpu_path, gpu_worst_path[0] ? gpu_worst_path : "(none)");
+}
+
 /* Called at every Present: ends an open query wait and logs averages. */
 static void waits_present(void) {
   waiting_query = NULL;
@@ -2367,6 +3186,8 @@ static volatile LONG factory_hooked, present_hooked;
 static HRESULT WINAPI hook_present(void *swapchain, UINT sync_interval, UINT flags) {
   frame_present();
   waits_present();
+  gpu_pass_present();
+  prepass_present();
   return orig_present(swapchain, sync_interval, flags);
 }
 
@@ -2487,7 +3308,8 @@ static void install_device_shader_hooks(void *device) {
       hook_clear_rtv,   hook_clear_dsv,      hook_viewports_set, hook_dispatch,
       hook_dispatch_indirect, hook_copy_resource, hook_copy_region, hook_resolve,
       hook_depth_state_set, hook_raster_state_set, hook_vs_srv_set, hook_ps_samplers_set,
-      hook_vs_samplers_set, hook_cs_samplers_set, hook_get_data, hook_map, hook_flush};
+      hook_vs_samplers_set, hook_cs_samplers_set, hook_get_data, hook_map, hook_flush,
+      hook_query_begin, hook_query_end};
   swap_vtable_slots(context_vtable, kContextSlots, context_hooks, orig_context, CTX_COUNT, kContextNames);
   ((release_fn)context_vtable[2])(context);
 }
@@ -2717,6 +3539,15 @@ static void setup(void) {
                                 (void *)GetProcAddress(dxgi, "CreateDXGIFactory1")))
       log_msg("frames: frame log disabled (dxgi %p)", (void *)dxgi);
   }
+  gpu_pass_setup();
+  cfg_skip_prepass = env_int("SC6VRR_SKIP_PREPASS", 0);
+  if (cfg_skip_prepass && !shader_dir[0]) {
+    log_msg("prepass: needs SC6VRR_SHADER_DIR (the hooks that track bindings); skip off");
+    cfg_skip_prepass = 0;
+  }
+  if (shader_dir[0])
+    log_msg("live: SC6VRR_SKIP_PREPASS=%d; F6 toggles it, and edits to sc6vrr.ini apply while the game runs",
+            cfg_skip_prepass);
   /* Frame-rate changes are switched off for now (2026-10-16). The engine hooks
    * below go in only with SC6VRR_FRAME_MODS=1, whatever the other settings say. */
   if (!env_int("SC6VRR_FRAME_MODS", 0)) {
