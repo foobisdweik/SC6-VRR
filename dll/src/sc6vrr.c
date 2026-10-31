@@ -3483,6 +3483,107 @@ static void install_query_wait(void) {
 
 /* ---------- setup -------------------------------------------------------- */
 
+/* ---------- offline login ------------------------------------------------ */
+/* SC6VRR_OFFLINE_LOGIN=1 skips the online login that the title screen starts
+ * after Start, which waits on Bandai Namco's servers. UE4 calls the native
+ * code of a reflected (Blueprint-callable) function through the pointer at
+ * UFunction+0xb0. A watcher thread swaps that pointer for RequestLogin to
+ * offline_request_login. This is a data write, not a code patch, so FEX's
+ * cache of translated code does not matter. Static analysis and first test:
+ * Codex, 2026-10-31 (/tmp/sc6-offline-fbeng0ir/offline-findings.md). */
+#define ADDR_REQUEST_LOGIN_UFUNC  0x144157f70ull /* UFunction* RequestLogin; nonzero once the class is built */
+#define ADDR_REQUEST_LOGIN_NATIVE 0x140bdafa0ull /* original native wrapper (reads 2 bools, calls LOGIN_IMPL) */
+#define ADDR_FRAME_STEP           0x140f73570ull /* FFrame::Step(frame, context, result) */
+#define ADDR_FRAME_STEP_EXPLICIT  0x140f735a0ull /* FFrame::StepExplicitProperty(frame, result, property) */
+#define ADDR_LOGIN_IMPL           0x14051d420ull /* native login task: (self, IsInterraptFlow, IsStartUp) */
+#define ADDR_SESSION_CLASS        0x140a51bf0ull /* returns the UClass of the session object */
+#define ADDR_GET_SESSION          0x14050bab0ull /* returns the session object of that class */
+#define ADDR_LOGIN_NOTIFY         0x140506130ull /* sends (success, error) to the waiting Blueprint */
+#define UFUNC_NATIVE_OFFSET 0xb0
+
+static int cfg_offline_login;
+static volatile LONG offline_login_calls, offline_login_fallbacks;
+
+/* Reads one bool argument the way the game's wrapper does (P_GET_UBOOL).
+ * FFrame+0x20 is the bytecode pointer, +0x18 the context object, +0x80 the
+ * property chain for calls from native code. */
+static int frame_read_bool(uint8_t *frame) {
+  int value = 0;
+  if (*(uintptr_t *)(frame + 0x20)) {
+    ((void (*)(void *, uintptr_t, int *))ADDR(ADDR_FRAME_STEP))(frame, *(uintptr_t *)(frame + 0x18), &value);
+  } else {
+    uintptr_t property = *(uintptr_t *)(frame + 0x80);
+    *(uintptr_t *)(frame + 0x80) = *(uintptr_t *)(property + 0x28); /* UField::Next */
+    ((void (*)(void *, int *, uintptr_t))ADDR(ADDR_FRAME_STEP_EXPLICIT))(frame, &value, property);
+  }
+  return value != 0;
+}
+
+/* Replaces RequestLogin's wrapper: it consumes the same two arguments, marks
+ * the session offline (session+0x128 = 0 makes IsOfflineMode true), and
+ * reports success (1, error 0) to the waiting Blueprint without contacting a
+ * server. If the session cannot be validated, it runs the original login. */
+static void offline_request_login(uint8_t *self, uint8_t *frame, void *result) {
+  (void)result;
+  int interrupt_flow = frame_read_bool(frame);
+  int startup = frame_read_bool(frame);
+  uintptr_t *code = (uintptr_t *)(frame + 0x20);
+  *code += *code != 0; /* step past the end-of-arguments byte */
+  self[0x98] = (uint8_t)startup;
+
+  uintptr_t (*session_class_fn)(void) = (uintptr_t (*)(void))ADDR(ADDR_SESSION_CLASS);
+  uintptr_t session = ((uintptr_t (*)(uintptr_t))ADDR(ADDR_GET_SESSION))(session_class_fn());
+  if (session) {
+    /* Same IsA check as the game's login code at 0x14051d473. */
+    uintptr_t expected = session_class_fn();
+    uintptr_t cls = *(uintptr_t *)(session + 0x10);
+    int32_t depth = *(int32_t *)(expected + 0x90);
+    if (depth >= 0 && depth <= *(int32_t *)(cls + 0x90) &&
+        ((uintptr_t *)*(uintptr_t *)(cls + 0x88))[depth] == expected + 0x88) {
+      *(uint8_t *)(session + 0x128) = 0;
+      ((uint64_t (*)(void *, uint8_t, uint8_t))ADDR(ADDR_LOGIN_NOTIFY))(self + 0x48, 1, 0);
+      log_msg("offline login: RequestLogin answered offline (call %ld, startup=%d)",
+              InterlockedIncrement(&offline_login_calls), startup);
+      return;
+    }
+  }
+  log_msg("offline login: session not found (%p); running the original online login (fallback %ld)",
+          (void *)session, InterlockedIncrement(&offline_login_fallbacks));
+  ((void (*)(void *, uint8_t, uint8_t))ADDR(ADDR_LOGIN_IMPL))(self, (uint8_t)interrupt_flow, (uint8_t)startup);
+}
+
+/* Waits until the engine builds the RequestLogin UFunction, then swaps its
+ * native pointer. It keeps checking twice a second in case the engine binds
+ * the function again. It never overwrites a pointer it does not recognize. */
+static DWORD WINAPI offline_login_watch(LPVOID unused) {
+  (void)unused;
+  void *original = ADDR(ADDR_REQUEST_LOGIN_NATIVE), *replacement = (void *)offline_request_login;
+  volatile uintptr_t *ufunc_slot = (volatile uintptr_t *)ADDR(ADDR_REQUEST_LOGIN_UFUNC);
+  int swaps = 0, warned = 0;
+  for (DWORD start = GetTickCount();;) {
+    uintptr_t ufunc = *ufunc_slot;
+    if (ufunc) {
+      void *volatile *native = (void *volatile *)(ufunc + UFUNC_NATIVE_OFFSET);
+      void *seen = InterlockedCompareExchangePointer(native, replacement, original);
+      if (seen == original)
+        log_msg("offline login: RequestLogin native pointer replaced (UFunction %p, swap %d, %lu ms after start)",
+                (void *)ufunc, ++swaps, (unsigned long)(GetTickCount() - start));
+      else if (seen != replacement && !warned++)
+        log_msg("offline login: unexpected native pointer %p (expected %p); left unchanged", seen, original);
+    }
+    Sleep(swaps ? 500 : 5);
+  }
+  return 0;
+}
+
+static void start_offline_login(void) {
+  HANDLE h = CreateThread(NULL, 0, offline_login_watch, NULL, 0, NULL);
+  if (h)
+    CloseHandle(h);
+  else
+    log_msg("offline login: CreateThread failed (%lu); online login unchanged", (unsigned long)GetLastError());
+}
+
 static void setup(void) {
   find_ini();
   open_log();
@@ -3514,6 +3615,10 @@ static void setup(void) {
     log_msg("sc6vrr: unknown exe build; no hooks installed");
     return;
   }
+  cfg_offline_login = env_int("SC6VRR_OFFLINE_LOGIN", 0);
+  log_msg("sc6vrr: offline_login=%d", cfg_offline_login);
+  if (cfg_offline_login)
+    start_offline_login();
   if (cfg_thread_names && !thread_name_observer)
     install_thread_name_observer();
   if (MH_Initialize() != MH_OK) {
