@@ -35,16 +35,20 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <d3d11.h>
+#include <d3d11_3.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <tlhelp32.h>
 #include "MinHook.h"
 #include "measurements.h"
 
 /* ---------- configuration and logging ---------------------------------- */
 
-static int cfg_uncap, cfg_gate, cfg_measure, cfg_frame_timers, cfg_thread_names;
+static int cfg_uncap, cfg_gate, cfg_measure, cfg_frame_timers, cfg_thread_names, cfg_block_query_wait;
 static float cfg_max_fps = 120.0f;
 static FILE *log_file;
 
@@ -119,6 +123,8 @@ static void open_log(void) {
   log_file = fopen(path, "w");
 }
 
+static void sample_note_thread(DWORD tid, const char *name); /* instruction-pointer sampler, below */
+
 /* Observe the game's legacy thread names without consuming its exception. */
 typedef HRESULT (WINAPI *set_thread_description_fn)(HANDLE, PCWSTR);
 static set_thread_description_fn set_thread_description;
@@ -153,6 +159,7 @@ static LONG CALLBACK observe_thread_name(EXCEPTION_POINTERS *exception) {
   }
   log_msg("thread_name_v=1 win_tid=%lu caller_tid=%lu hr=0x%08lx name=%s",
           (unsigned long)target, (unsigned long)caller, (unsigned long)result, name);
+  sample_note_thread(target, name);
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -162,6 +169,417 @@ static void install_thread_name_observer(void) {
   thread_name_observer = AddVectoredExceptionHandler(1, observe_thread_name);
   log_msg("thread names: observer=%s native_naming=%s; original exception handling is preserved",
           thread_name_observer ? "enabled" : "failed", set_thread_description ? "available" : "unavailable");
+}
+
+/* ---------- instruction-pointer sampler ---------------------------------- */
+
+/*
+ * SC6VRR_SAMPLE=1 starts a helper thread that, about SC6VRR_SAMPLE_HZ times a
+ * second, pauses each watched game thread for a moment, reads its instruction
+ * pointer (RIP, the address of the code it is running) and resumes it. The
+ * counts per address go to sc6vrr-samples.tsv, so a later script can name the
+ * functions that use the most time. This replaces the macOS `sample` tool,
+ * which gave invalid Windows stacks (notes/thread-identity.md).
+ *
+ * While a thread is paused the sampler must not take any lock the thread may
+ * hold. So it copies RIP and a slice of the stack, resumes the thread at once,
+ * and only then counts. It never allocates and never logs inside that window.
+ *
+ * Watched threads: the thread that loads this DLL (the game thread), every
+ * "RenderThread" and "RHIThread", and with SC6VRR_SAMPLE_ALL=1 also the
+ * TaskGraph workers and the async loading thread. The game names its threads
+ * with the legacy exception that observe_thread_name() sees.
+ */
+
+enum { ROLE_GAME, ROLE_RENDER, ROLE_RHI, ROLE_TASK, ROLE_ASYNC, ROLE_COUNT };
+static const char *const kRoleNames[ROLE_COUNT] = {"game", "render", "rhi", "taskgraph", "asyncload"};
+/* KIND_RIP counts where the thread was. KIND_CALLER1..3 count the first three
+ * return addresses (inside the exe) that the sampler finds on the stack. */
+enum { KIND_RIP, KIND_CALLER1, KIND_CALLER2, KIND_CALLER3, KIND_COUNT };
+static const char *const kKindNames[KIND_COUNT] = {"rip", "caller1", "caller2", "caller3"};
+
+#define SAMPLE_THREADS 128
+#define SAMPLE_SLOTS (1u << 17)
+#define SAMPLE_STACK_QWORDS 128
+#define SAMPLE_LINES_PER_GROUP 4000
+
+typedef struct {
+  volatile DWORD tid;
+  int role;
+  HANDLE handle;
+  int dead;
+  const NT_TIB *tib; /* the thread's TIB (start of its TEB); NULL = take RIP only */
+} sample_thread;
+typedef struct {
+  uint64_t key; /* (role * KIND_COUNT + kind) << 56 | address; 0 = empty slot */
+  uint32_t count;
+} sample_slot;
+typedef struct {
+  uint64_t base, size;
+  char name[40];
+} sample_module;
+
+static int cfg_sample, cfg_sample_hz = 250, cfg_sample_all, cfg_sample_dump_secs = 10;
+static char sample_path[MAX_PATH];
+static sample_thread sample_threads[SAMPLE_THREADS];
+static volatile LONG sample_thread_count;
+static sample_slot sample_table[SAMPLE_SLOTS];
+static sample_slot sample_sorted[SAMPLE_SLOTS];
+static size_t sample_used;
+static uint64_t sample_overflow, sample_passes, sample_open_fail, sample_suspend_fail, sample_context_fail;
+static uint64_t exe_code_lo, exe_code_hi, exe_base_now;
+static int sample_exe_ok;
+static volatile LONG sample_stop;
+
+static void find_exe_code(void) {
+  const uint8_t *base = (const uint8_t *)GetModuleHandleW(NULL);
+  exe_base_now = (uint64_t)(uintptr_t)base;
+  const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    return;
+  const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return;
+  const IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
+  for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+    if (!(s[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+      continue;
+    uint64_t lo = exe_base_now + s[i].VirtualAddress, hi = lo + s[i].Misc.VirtualSize;
+    if (!exe_code_lo || lo < exe_code_lo)
+      exe_code_lo = lo;
+    if (hi > exe_code_hi)
+      exe_code_hi = hi;
+  }
+}
+
+/* A return address follows a call instruction. This checks the bytes before
+ * the address for the common call forms, so stale numbers on the stack that
+ * merely point into the code are mostly rejected. It is a heuristic. */
+static int looks_like_return(uint64_t a) {
+  if (a < exe_code_lo + 8 || a >= exe_code_hi)
+    return 0;
+  const uint8_t *p = (const uint8_t *)(uintptr_t)a;
+  if (p[-5] == 0xE8) /* call rel32 */
+    return 1;
+  static const int lengths[] = {2, 3, 4, 6, 7}; /* FF /2 with a register, disp8, SIB or disp32 */
+  for (unsigned i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++)
+    if (p[-lengths[i]] == 0xFF && ((p[-lengths[i] + 1] >> 3) & 7) == 2)
+      return 1;
+  return 0;
+}
+
+static void sample_register(DWORD tid, int role) {
+  LONG count = sample_thread_count;
+  if (count > SAMPLE_THREADS)
+    count = SAMPLE_THREADS;
+  for (LONG i = 0; i < count; i++)
+    if (sample_threads[i].tid == tid)
+      return;
+  LONG slot = InterlockedIncrement(&sample_thread_count) - 1;
+  if (slot >= SAMPLE_THREADS)
+    return;
+  sample_threads[slot].role = role;
+  MemoryBarrier();
+  sample_threads[slot].tid = tid; /* the sampler skips a slot until its tid is set */
+}
+
+static void sample_note_thread(DWORD tid, const char *name) {
+  if (!cfg_sample)
+    return;
+  int role = -1;
+  if (!strncmp(name, "RenderThread", 12))
+    role = ROLE_RENDER;
+  else if (!strncmp(name, "RHIThread", 9))
+    role = ROLE_RHI;
+  else if (cfg_sample_all && !strncmp(name, "TaskGraph", 9))
+    role = ROLE_TASK;
+  else if (cfg_sample_all && !strncmp(name, "FAsyncLoadingThread", 19))
+    role = ROLE_ASYNC;
+  if (role >= 0)
+    sample_register(tid, role);
+}
+
+static void sample_add(int role, int kind, uint64_t addr) {
+  if (!addr)
+    return;
+  uint64_t key = ((uint64_t)(role * KIND_COUNT + kind) << 56) | (addr & 0x00FFFFFFFFFFFFFFull);
+  size_t i = (size_t)((key * 0x9E3779B97F4A7C15ull) >> 47) & (SAMPLE_SLOTS - 1);
+  for (size_t n = 0; n < SAMPLE_SLOTS; n++, i = (i + 1) & (SAMPLE_SLOTS - 1)) {
+    if (sample_table[i].key == key) {
+      sample_table[i].count++;
+      return;
+    }
+    if (!sample_table[i].key) {
+      if (sample_used >= SAMPLE_SLOTS / 4 * 3) {
+        sample_overflow++;
+        return;
+      }
+      sample_table[i].key = key;
+      sample_table[i].count = 1;
+      sample_used++;
+      return;
+    }
+  }
+}
+
+static int sample_compare(const void *a, const void *b) {
+  const sample_slot *x = a, *y = b;
+  uint64_t gx = x->key >> 56, gy = y->key >> 56;
+  if (gx != gy)
+    return gx < gy ? -1 : 1;
+  if (x->count != y->count)
+    return x->count > y->count ? -1 : 1;
+  return 0;
+}
+
+static sample_module sample_modules[256];
+static int sample_module_count;
+
+static void load_sample_modules(void) {
+  sample_module_count = 0;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snap == INVALID_HANDLE_VALUE)
+    return;
+  MODULEENTRY32W entry;
+  entry.dwSize = sizeof(entry);
+  for (BOOL ok = Module32FirstW(snap, &entry); ok && sample_module_count < 256; ok = Module32NextW(snap, &entry)) {
+    sample_module *m = &sample_modules[sample_module_count++];
+    m->base = (uint64_t)(uintptr_t)entry.modBaseAddr;
+    m->size = entry.modBaseSize;
+    WideCharToMultiByte(CP_UTF8, 0, entry.szModule, -1, m->name, sizeof(m->name) - 1, NULL, NULL);
+    m->name[sizeof(m->name) - 1] = 0;
+  }
+  CloseHandle(snap);
+}
+
+static int find_sample_module(uint64_t addr) {
+  for (int i = 0; i < sample_module_count; i++)
+    if (addr >= sample_modules[i].base && addr < sample_modules[i].base + sample_modules[i].size)
+      return i;
+  return -1;
+}
+
+/* Writes the counts to a temporary file and renames it over the real one, so
+ * a reader never sees half a file. Runs only on the sampler thread, while no
+ * game thread is paused. */
+static void sample_dump(DWORD started_ms, const char *path) {
+  size_t n = 0;
+  for (size_t i = 0; i < SAMPLE_SLOTS; i++)
+    if (sample_table[i].key)
+      sample_sorted[n++] = sample_table[i];
+  qsort(sample_sorted, n, sizeof(sample_sorted[0]), sample_compare);
+  load_sample_modules();
+  static uint64_t role_total[ROLE_COUNT];
+  static uint64_t module_sum[ROLE_COUNT][257]; /* the last column is "no module" */
+  memset(role_total, 0, sizeof(role_total));
+  memset(module_sum, 0, sizeof(module_sum));
+  for (size_t i = 0; i < n; i++) {
+    unsigned group = (unsigned)(sample_sorted[i].key >> 56);
+    if (group % KIND_COUNT != KIND_RIP)
+      continue;
+    int role = (int)(group / KIND_COUNT);
+    int m = find_sample_module(sample_sorted[i].key & 0x00FFFFFFFFFFFFFFull);
+    role_total[role] += sample_sorted[i].count;
+    module_sum[role][m < 0 ? 256 : m] += sample_sorted[i].count;
+  }
+  char tmp[MAX_PATH + 8];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  FILE *f = fopen(tmp, "w");
+  if (!f)
+    return;
+  fprintf(f, "# sc6vrr samples v1\n");
+  fprintf(f, "# exe_hash_ok=%d exe_base=0x%llx ghidra_base=0x140000000 hz=%d all=%d\n", sample_exe_ok,
+          (unsigned long long)exe_base_now, cfg_sample_hz, cfg_sample_all);
+  fprintf(f, "# elapsed_ms=%lu passes=%llu open_fail=%llu suspend_fail=%llu context_fail=%llu table_overflow=%llu\n",
+          (unsigned long)(GetTickCount() - started_ms), (unsigned long long)sample_passes,
+          (unsigned long long)sample_open_fail, (unsigned long long)sample_suspend_fail,
+          (unsigned long long)sample_context_fail, (unsigned long long)sample_overflow);
+  for (int r = 0; r < ROLE_COUNT; r++) {
+    if (!role_total[r])
+      continue;
+    fprintf(f, "# role_samples\t%s\t%llu\n", kRoleNames[r], (unsigned long long)role_total[r]);
+    for (int m = 0; m <= sample_module_count && m <= 256; m++) {
+      uint64_t c = module_sum[r][m < sample_module_count ? m : 256];
+      if (m <= sample_module_count && c)
+        fprintf(f, "# module_samples\t%s\t%s\t%llu\n", kRoleNames[r], m < sample_module_count ? sample_modules[m].name : "?",
+                (unsigned long long)c);
+    }
+  }
+  fprintf(f, "role\tkind\tmodule\taddr\tcount\n");
+  unsigned long long emitted = 0;
+  unsigned last_group = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; i++) {
+    unsigned group = (unsigned)(sample_sorted[i].key >> 56);
+    if (group != last_group) {
+      last_group = group;
+      emitted = 0;
+    }
+    if (emitted++ >= SAMPLE_LINES_PER_GROUP)
+      continue;
+    uint64_t addr = sample_sorted[i].key & 0x00FFFFFFFFFFFFFFull;
+    int m = find_sample_module(addr);
+    const char *name = m < 0 ? "?" : sample_modules[m].name;
+    uint64_t shown = addr;
+    if (m >= 0 && sample_modules[m].base == exe_base_now) {
+      name = "exe";
+      shown = addr - exe_base_now + 0x140000000ull; /* the address Ghidra shows */
+    } else if (m >= 0) {
+      shown = addr - sample_modules[m].base; /* offset inside the module */
+    }
+    fprintf(f, "%s\t%s\t%s\t0x%llx\t%u\n", kRoleNames[group / KIND_COUNT], kKindNames[group % KIND_COUNT], name,
+            (unsigned long long)shown, sample_sorted[i].count);
+  }
+  fclose(f);
+  MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+}
+
+/* Returns the address of the thread's TIB, or NULL when ntdll cannot say. This
+ * runs while the thread is not paused. */
+static const NT_TIB *sample_thread_tib(HANDLE thread) {
+  typedef struct {
+    LONG exit_status;
+    PVOID teb;
+    PVOID client_id[2];
+    ULONG_PTR affinity;
+    LONG priority, base_priority;
+  } basic_info;
+  typedef LONG(NTAPI * query_fn)(HANDLE, int, PVOID, ULONG, PULONG);
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  query_fn query = ntdll ? (query_fn)GetProcAddress(ntdll, "NtQueryInformationThread") : NULL;
+  basic_info info;
+  if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), NULL) < 0)
+    return NULL;
+  return (const NT_TIB *)info.teb;
+}
+
+static DWORD WINAPI sampler_main(LPVOID unused) {
+  (void)unused;
+  uint32_t rng = GetTickCount() | 1;
+  DWORD period = (DWORD)(1000 / cfg_sample_hz);
+  if (!period)
+    period = 1;
+  DWORD started = GetTickCount(), next_dump = started + (DWORD)cfg_sample_dump_secs * 1000;
+  int reset_was_down = 0, snapshot_was_down = 0;
+  unsigned snapshot_count = 0;
+  for (;;) {
+    /* A random wait (mean = period) keeps the sampler from locking on to the
+     * game's own frame rhythm. */
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    DWORD wait = period / 2 + rng % (period + 1);
+    Sleep(wait ? wait : 1);
+    if (sample_stop)
+      break;
+    int reset_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (reset_down && !reset_was_down) {
+      memset(sample_table, 0, sizeof(sample_table));
+      sample_used = sample_overflow = sample_passes = 0;
+      started = GetTickCount();
+      log_msg("sample: counts cleared by F9");
+    }
+    reset_was_down = reset_down;
+    /* F8 saves the counts so far to sc6vrr-samples.<n>.tsv and keeps counting.
+     * With F9 at the start of a round, that gives one file per round. */
+    int snapshot_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    if (snapshot_down && !snapshot_was_down) {
+      char numbered[MAX_PATH + 16];
+      size_t stem = strlen(sample_path);
+      if (stem > 4 && !_stricmp(sample_path + stem - 4, ".tsv"))
+        stem -= 4;
+      snprintf(numbered, sizeof(numbered), "%.*s.%u.tsv", (int)stem, sample_path, ++snapshot_count);
+      sample_dump(started, numbered);
+      log_msg("sample: snapshot saved to %s", numbered);
+    }
+    snapshot_was_down = snapshot_down;
+    LONG count = sample_thread_count;
+    if (count > SAMPLE_THREADS)
+      count = SAMPLE_THREADS;
+    for (LONG i = 0; i < count; i++) {
+      sample_thread *t = &sample_threads[i];
+      if (!t->tid || t->dead)
+        continue;
+      if (!t->handle) {
+        t->handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, t->tid);
+        if (!t->handle) {
+          t->dead = 1;
+          sample_open_fail++;
+          continue;
+        }
+        t->tib = sample_thread_tib(t->handle);
+      }
+      CONTEXT ctx;
+      ctx.ContextFlags = CONTEXT_CONTROL;
+      uint64_t stack[SAMPLE_STACK_QWORDS];
+      SIZE_T got = 0;
+      /* Paused window. The paused thread may hold any lock inside Wine or the
+       * C library, so only calls that take no lock are allowed here. That rules
+       * out ReadProcessMemory (it probably takes Wine's virtual-memory lock), VirtualQuery,
+       * allocation and logging. A boot hang on 2026-10-31 may have come from here; unproven.
+       * The stack is read directly instead, but only between RSP and the stack
+       * base from the thread's TIB, which is committed memory that cannot fault. */
+      if (SuspendThread(t->handle) == (DWORD)-1) {
+        sample_suspend_fail++;
+        CloseHandle(t->handle);
+        t->handle = NULL;
+        t->dead = 1; /* the thread has probably exited */
+        continue;
+      }
+      BOOL ok = GetThreadContext(t->handle, &ctx);
+      if (ok && t->tib) {
+        uint64_t sp = ctx.Rsp, lo = (uint64_t)(uintptr_t)t->tib->StackLimit, hi = (uint64_t)(uintptr_t)t->tib->StackBase;
+        if (sp >= lo && sp < hi && !(sp & 7)) {
+          got = hi - sp < sizeof(stack) ? (SIZE_T)(hi - sp) : sizeof(stack);
+          const volatile uint64_t *src = (const volatile uint64_t *)(uintptr_t)sp;
+          for (SIZE_T q = 0; q < got / 8; q++)
+            stack[q] = src[q];
+        }
+      }
+      ResumeThread(t->handle);
+      /* Thread running again. */
+      if (!ok) {
+        sample_context_fail++;
+        continue;
+      }
+      sample_add(t->role, KIND_RIP, ctx.Rip);
+      int depth = KIND_CALLER1;
+      for (SIZE_T q = 0; q < got / 8 && depth <= KIND_CALLER3; q++)
+        if (looks_like_return(stack[q]))
+          sample_add(t->role, depth++, stack[q]);
+    }
+    sample_passes++;
+    if ((LONG)(GetTickCount() - next_dump) >= 0) {
+      sample_dump(started, sample_path);
+      next_dump = GetTickCount() + (DWORD)cfg_sample_dump_secs * 1000;
+    }
+  }
+  sample_dump(started, sample_path);
+  return 0;
+}
+
+static void start_sampler(int exe_ok) {
+  sample_exe_ok = exe_ok;
+  find_exe_code();
+  if (!cfg_str("SC6VRR_SAMPLE_FILE", sample_path, sizeof(sample_path))) {
+    DWORD n = GetModuleFileNameA(NULL, sample_path, sizeof(sample_path));
+    char *slash = (n && n < sizeof(sample_path)) ? strrchr(sample_path, '\\') : NULL;
+    if (!slash || (size_t)(slash + 1 - sample_path) + sizeof("sc6vrr-samples.tsv") > sizeof(sample_path)) {
+      log_msg("sample: no output path; sampler off");
+      return;
+    }
+    strcpy(slash + 1, "sc6vrr-samples.tsv");
+  }
+  if (!thread_name_observer)
+    install_thread_name_observer();
+  sample_register(GetCurrentThreadId(), ROLE_GAME);
+  HANDLE h = CreateThread(NULL, 0, sampler_main, NULL, 0, NULL);
+  if (!h) {
+    log_msg("sample: CreateThread failed (%lu); sampler off", (unsigned long)GetLastError());
+    return;
+  }
+  CloseHandle(h);
+  log_msg("sample: on, %d Hz, all=%d, game thread %lu, output %s", cfg_sample_hz, cfg_sample_all,
+          (unsigned long)GetCurrentThreadId(), sample_path);
 }
 
 /* ---------- exe identity ------------------------------------------------- */
@@ -2122,6 +2540,125 @@ static int install_shader_capture(void *create_device, void *create_device_swapc
   return hooked > 0;
 }
 
+/* ---------- blocking wait for the GPU event query ----------------------- */
+
+/* FUN_1412111a0 is UE4's FD3D11EventQuery::WaitForCompletion. After it issues
+ * an event query (a marker that completes when the GPU has finished all work
+ * submitted so far), it calls ID3D11DeviceContext::GetData in a loop until the
+ * query completes, so the render thread uses a full CPU core while it waits.
+ * D3D11 has no blocking wait for a query, but DXMT's Flush1(type, event)
+ * (ID3D11DeviceContext3) sets a Win32 event when the GPU reaches the current
+ * command, so this hook waits on that event instead of polling.
+ * The hook always ends in the original function, which polls and then finds
+ * the query done at once, so a wrong or late event never changes the result. */
+#define ADDR_QUERY_WAIT 0x1412111a0ull
+#define ADDR_QUERY_WAIT_STAT_TIME  0x14435185cull /* the game's own wait-time counters */
+#define ADDR_QUERY_WAIT_STAT_COUNT 0x14435186cull
+#define QUERY_WAIT_STEP_MS 1 /* the wait is cut into steps of this length */
+
+/* b4e3c01d-e79e-4637-91b2-510e9f4c9b8f; defined here so the build needs no dxguid library. */
+static const GUID kIidDeviceContext3 = {0xb4e3c01d, 0xe79e, 0x4637, {0x91, 0xb2, 0x51, 0x0e, 0x9f, 0x4c, 0x9b, 0x8f}};
+static void (*orig_query_wait)(void *);
+static HANDLE query_wait_event;
+static ID3D11DeviceContext *query_wait_ctx; /* the context that query_wait_ctx3 belongs to */
+static ID3D11DeviceContext3 *query_wait_ctx3;
+static volatile LONG query_wait_disabled;
+static unsigned query_wait_count, query_wait_by_poll, query_wait_poll_run, query_wait_slow_logged;
+static unsigned long long query_wait_us_total;
+
+static void hook_query_wait(void *self) {
+  char *rhi = *(char **)((char *)self + 0x30); /* the RHI object that holds the device context */
+  ID3D11DeviceContext *ctx = rhi ? *(ID3D11DeviceContext **)(rhi + 0x70) : NULL;
+  ID3D11Asynchronous *query = *(ID3D11Asynchronous **)((char *)self + 0x38);
+  if (query_wait_disabled || !ctx || !query || !query_wait_event) {
+    orig_query_wait(self);
+    return;
+  }
+  BOOL done = 0;
+  HRESULT hr = ctx->lpVtbl->GetData(ctx, (ID3D11Asynchronous *)query, &done, sizeof(done), 0);
+  if (hr != S_FALSE) { /* already done, or an error that the original reports */
+    if (hr == S_OK && done)
+      return;
+    orig_query_wait(self);
+    return;
+  }
+  if (ctx != query_wait_ctx) {
+    if (query_wait_ctx3)
+      query_wait_ctx3->lpVtbl->Release(query_wait_ctx3);
+    query_wait_ctx3 = NULL;
+    query_wait_ctx = ctx;
+    if (FAILED(ctx->lpVtbl->QueryInterface(ctx, &kIidDeviceContext3, (void **)&query_wait_ctx3)))
+      query_wait_ctx3 = NULL;
+  }
+  if (!query_wait_ctx3) {
+    log_msg("query wait: context has no ID3D11DeviceContext3; using the game's polling loop");
+    InterlockedExchange(&query_wait_disabled, 1);
+    orig_query_wait(self);
+    return;
+  }
+  LARGE_INTEGER t0, t1, freq;
+  QueryPerformanceCounter(&t0);
+  ResetEvent(query_wait_event);
+  query_wait_ctx3->lpVtbl->Flush1(query_wait_ctx3, D3D11_CONTEXT_TYPE_ALL, query_wait_event);
+  /* Wait for the event in 1 ms steps, up to the original's 0.5 s limit. After
+   * each step, ask the query itself. DXMT delivers the event through a run
+   * loop thread, and in the 2026-10-31 run it often arrived more than 20 ms
+   * late. The 1 ms step keeps such a late event from stalling the render
+   * thread: the query check ends the wait as soon as the GPU is done. */
+  DWORD w = WAIT_TIMEOUT;
+  DWORD waited = 0;
+  int by_poll = 0;
+  while (w == WAIT_TIMEOUT && waited < 500) {
+    w = WaitForSingleObject(query_wait_event, QUERY_WAIT_STEP_MS);
+    waited += QUERY_WAIT_STEP_MS;
+    if (w == WAIT_TIMEOUT) {
+      BOOL again = 0;
+      if (ctx->lpVtbl->GetData(ctx, (ID3D11Asynchronous *)query, &again, sizeof(again), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK && again) {
+        by_poll = 1;
+        break;
+      }
+    }
+  }
+  QueryPerformanceCounter(&t1);
+  QueryPerformanceFrequency(&freq);
+  unsigned long long us = (unsigned long long)(t1.QuadPart - t0.QuadPart) * 1000000ull / (unsigned long long)freq.QuadPart;
+  query_wait_us_total += us;
+  query_wait_count++;
+  if (by_poll)
+    query_wait_by_poll++;
+  if (us > 50000 && query_wait_slow_logged++ < 10)
+    log_msg("query wait: slow wait, %llu us (%s)", us, by_poll ? "found done by the query check" : "event");
+  /* The event never arrived in 300 waits in a row: this DXMT build probably
+   * does not send it, so the 1 ms steps would only add delay. Stop using them. */
+  query_wait_poll_run = by_poll ? query_wait_poll_run + 1 : 0;
+  if (query_wait_poll_run >= 300) {
+    log_msg("query wait: event missing in %u waits in a row; back to the game's polling loop", query_wait_poll_run);
+    InterlockedExchange(&query_wait_disabled, 1);
+  }
+  if (query_wait_count % 3600 == 0)
+    log_msg("query wait: %u waits, %u ended by the event, %.2f ms on average", query_wait_count,
+            query_wait_count - query_wait_by_poll, query_wait_us_total / 1000.0 / query_wait_count);
+  /* The original polls once more and returns at once when the query is done.
+   * Its own time counters stay unchanged for waits that this hook handled, so
+   * add this wait to them the way the original does. */
+  *(DWORD *)ADDR(ADDR_QUERY_WAIT_STAT_TIME) += (DWORD)t1.LowPart - (DWORD)t0.LowPart;
+  *(DWORD *)ADDR(ADDR_QUERY_WAIT_STAT_COUNT) += 1;
+  orig_query_wait(self);
+}
+
+static void install_query_wait(void) {
+  if (!bytes_match(ADDR(ADDR_QUERY_WAIT), "488bc4535657415641574883ec700f2970b84533ff0f2978a84c8bf1")) {
+    log_msg("query wait: function prologue mismatch; blocking wait disabled");
+    return;
+  }
+  query_wait_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+  MH_STATUS st = query_wait_event ? MH_CreateHook(ADDR(ADDR_QUERY_WAIT), hook_query_wait, (void **)&orig_query_wait)
+                                  : MH_ERROR_MEMORY_ALLOC;
+  if (st == MH_OK)
+    st = MH_EnableHook(ADDR(ADDR_QUERY_WAIT));
+  log_msg("query wait: blocking wait hook %s (%d)", st == MH_OK ? "installed" : "failed", st);
+}
+
 /* ---------- setup -------------------------------------------------------- */
 
 static void setup(void) {
@@ -2137,16 +2674,33 @@ static void setup(void) {
   cfg_max_fps = (float)env_int("SC6VRR_MAX_FPS", 120);
   log_msg("sc6vrr: uncap=%d gate=%d max_fps=%.0f measure=%d", cfg_uncap, cfg_gate, cfg_max_fps, cfg_measure);
 
-  if (!exe_hash_matches()) {
+  int exe_ok = exe_hash_matches();
+  /* The sampler only reads, so it also runs on an unknown exe build (the
+   * tests use that). It must start on this thread: the thread that loads the
+   * DLL is the game thread. */
+  cfg_sample = env_int("SC6VRR_SAMPLE", 0);
+  if (cfg_sample) {
+    cfg_sample_hz = env_int("SC6VRR_SAMPLE_HZ", 250);
+    cfg_sample_hz = cfg_sample_hz < 10 ? 10 : cfg_sample_hz > 1000 ? 1000 : cfg_sample_hz;
+    cfg_sample_all = env_int("SC6VRR_SAMPLE_ALL", 0);
+    cfg_sample_dump_secs = env_int("SC6VRR_SAMPLE_DUMP_SECS", 10);
+    if (cfg_sample_dump_secs < 1)
+      cfg_sample_dump_secs = 1;
+    start_sampler(exe_ok);
+  }
+  if (!exe_ok) {
     log_msg("sc6vrr: unknown exe build; no hooks installed");
     return;
   }
-  if (cfg_thread_names)
+  if (cfg_thread_names && !thread_name_observer)
     install_thread_name_observer();
   if (MH_Initialize() != MH_OK) {
     log_msg("sc6vrr: MH_Initialize failed");
     return;
   }
+  cfg_block_query_wait = env_int("SC6VRR_BLOCK_QUERY_WAIT", 0);
+  if (cfg_block_query_wait)
+    install_query_wait();
   /* Shader capture hooks only d3d11.dll exports, so it does not depend on the
    * engine prologue checks below and enables its own hooks. */
   char dir[MAX_PATH];
@@ -2253,9 +2807,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     /* Runs before the game's main code; only the loader thread exists, so
      * patching code here cannot race with game threads. */
     setup();
-  } else if (reason == DLL_PROCESS_DETACH && thread_name_observer) {
-    RemoveVectoredExceptionHandler(thread_name_observer);
-    thread_name_observer = NULL;
+  } else if (reason == DLL_PROCESS_DETACH) {
+    sample_stop = 1; /* the sampler writes its last file when it sees this */
+    if (thread_name_observer) {
+      RemoveVectoredExceptionHandler(thread_name_observer);
+      thread_name_observer = NULL;
+    }
   }
   return TRUE;
 }

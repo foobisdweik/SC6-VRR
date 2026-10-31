@@ -16,10 +16,24 @@ x86_64-w64-mingw32-gcc -O2 -Wall -o dll/build/test-shader-capture.exe \
   tests/test_shader_capture.c third_party/minhook/src/buffer.c third_party/minhook/src/hook.c \
   third_party/minhook/src/trampoline.c third_party/minhook/src/hde/hde64.c \
   -Ithird_party/minhook/include -lbcrypt -static-libgcc
+x86_64-w64-mingw32-gcc -O2 -Wall -o dll/build/test-sampler.exe \
+  tests/test_sampler.c third_party/minhook/src/buffer.c third_party/minhook/src/hook.c \
+  third_party/minhook/src/trampoline.c third_party/minhook/src/hde/hde64.c \
+  -Ithird_party/minhook/include -lbcrypt -static-libgcc
+x86_64-w64-mingw32-gcc -O2 -Wall -o dll/build/test-sampler-lock.exe \
+  tests/test_sampler_lock.c third_party/minhook/src/buffer.c third_party/minhook/src/hook.c \
+  third_party/minhook/src/trampoline.c third_party/minhook/src/hde/hde64.c \
+  -Ithird_party/minhook/include -lbcrypt -static-libgcc
 if [[ ${1:-} == --wine ]]; then
   # Tests run in the CrossOver Preview x86-64 bottle (Rosetta 2). Its startup
   # list is empty, so starting it does not launch Steam.
   wine=${CROSSOVER_APP:-/Applications/CrossOver Preview.app}/Contents/SharedSupport/CrossOver/bin/wine
   "$wine" --bottle ${SC6_BOTTLE:-SC6-Rosetta} "$repo/dll/build/test-clock-cave.exe"
   "$wine" --bottle ${SC6_BOTTLE:-SC6-Rosetta} "$repo/dll/build/test-shader-capture.exe"
+  # The sampler test writes its samples file here; Wine's Z: drive is the macOS root.
+  sample_file=$(mktemp -u /tmp/sc6vrr-sampler-test.XXXXXX)
+  "$wine" --bottle ${SC6_BOTTLE:-SC6-Rosetta} --env "SC6VRR_SAMPLE_FILE=Z:$sample_file" "$repo/dll/build/test-sampler.exe"
+  rm -f "$sample_file" "$sample_file.tmp"
+  "$wine" --bottle ${SC6_BOTTLE:-SC6-Rosetta} --env "SC6VRR_SAMPLE_FILE=Z:$sample_file" "$repo/dll/build/test-sampler-lock.exe"
+  rm -f "$sample_file" "$sample_file.tmp"
 fi
