@@ -90,8 +90,102 @@ static void test_thread_names(void) {
   puts("Legacy thread names propagate; invalid records are ignored; original exception handling continues.");
 }
 
+static int gate_target_calls;
+static int64_t gate_int_target(int64_t a, int64_t b, int64_t c, int64_t d) {
+  gate_target_calls++;
+  return a + 2 * b + 3 * c + 4 * d;
+}
+static float gate_float_target(float x) {
+  gate_target_calls++;
+  return x * 2.0f;
+}
+
+/* The gate stub passes all arguments through on a step frame and counts the
+ * call; on a frame without a step it returns at once without calling (0.0f
+ * for a float function; rax is left undefined, so only void and float
+ * functions may be gated). */
+static void test_gate_stub(void) {
+  uint8_t *mem = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  assert(mem);
+  void **slot_int, **slot_float;
+  volatile uint64_t count_int = 0, count_float = 0;
+  uint8_t *stub_float = make_gate_stub(mem, 0, &slot_int, &count_int);
+  make_gate_stub(stub_float, 1, &slot_float, &count_float);
+  *slot_int = (void *)gate_int_target;
+  *slot_float = (void *)gate_float_target;
+  FlushInstructionCache(GetCurrentProcess(), mem, 4096);
+  int64_t (*int_stub)(int64_t, int64_t, int64_t, int64_t) = (void *)mem;
+  float (*float_stub)(float) = (void *)stub_float;
+  g_skip_battle = 0;
+  assert(int_stub(1, 2, 3, 4) == 30);
+  assert(float_stub(1.5f) == 3.0f);
+  assert(gate_target_calls == 2 && count_int == 1 && count_float == 1);
+  g_skip_battle = 1;
+  int_stub(1, 2, 3, 4); /* a skip leaves rax undefined: gated functions return void or float */
+  assert(float_stub(1.5f) == 0.0f);
+  assert(gate_target_calls == 2 && count_int == 1 && count_float == 1);
+  g_skip_battle = 0;
+  VirtualFree(mem, 0, MEM_RELEASE);
+}
+
+static WORD fake_pad_buttons;
+static DWORD WINAPI fake_xinput(DWORD user, sc6_xinput_state *st) {
+  memset(st, 0, sizeof(*st));
+  st->buttons = user == 0 ? fake_pad_buttons : 0;
+  return ERROR_SUCCESS;
+}
+
+/* Early step: only a new non-direction press, on a frame without a step,
+ * when the step is due on the next frame. Latch: a released tap stays down
+ * until the sticky bits are cleared (hook_update_time does that after a step). */
+static void test_input_hook(void) {
+  sc6_xinput_state st;
+  orig_xinput_get_state = fake_xinput;
+  input_engine_thread = GetCurrentThreadId();
+  cfg_early_step = early_step_available = input_in_battle = 1;
+  input_online = 0;
+  input_phase = 1;
+  g_skip_battle = 1;
+  gate_last_dt = 1.0 / 120.0;
+  gate_acc = 0.001; /* next step two frames away: not due */
+  fake_pad_buttons = 0x1000;
+  hook_xinput_get_state(0, &st);
+  assert(g_skip_battle == 1 && input_stats.early == 0);
+  fake_pad_buttons = 0;
+  hook_xinput_get_state(0, &st);
+  gate_acc = 1.0 / 120.0; /* due on the next frame */
+  fake_pad_buttons = 0x0001; /* D-pad up: never an early step */
+  hook_xinput_get_state(0, &st);
+  assert(g_skip_battle == 1 && input_stats.early == 0);
+  fake_pad_buttons = 0x0001 | 0x2000; /* B */
+  hook_xinput_get_state(0, &st);
+  assert(g_skip_battle == 0 && input_stats.early == 1);
+  assert(gate_acc < 0 && gate_acc > -1.0 / 60.0);
+  /* Latch: B released before a step read it is still reported. */
+  cfg_early_step = 0;
+  cfg_input_latch = 1;
+  memset(xi_last, 0, sizeof(xi_last));
+  memset(xi_sticky, 0, sizeof(xi_sticky));
+  fake_pad_buttons = 0x2000;
+  hook_xinput_get_state(0, &st);
+  fake_pad_buttons = 0;
+  hook_xinput_get_state(0, &st);
+  assert(st.buttons == 0x2000);
+  memset(xi_sticky, 0, sizeof(xi_sticky));
+  hook_xinput_get_state(0, &st);
+  assert(st.buttons == 0);
+  cfg_input_latch = 0;
+  orig_xinput_get_state = NULL;
+  input_engine_thread = 0;
+  input_in_battle = early_step_available = 0;
+  g_skip_battle = 0;
+  memset(&input_stats, 0, sizeof(input_stats));
+}
+
 int main(void) {
   test_thread_names();
+  test_gate_stub();
+  test_input_hook();
   uint8_t object[0x3A8] = {0};
   uint32_t *clock = (uint32_t *)(object + 0x3A4);
   uint8_t *cave = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);

@@ -692,6 +692,11 @@ static uint8_t *alloc_near(void *target, size_t size) {
  * Read by generated machine code, so it is a plain byte. */
 static volatile uint8_t g_skip_battle = 0;
 static volatile uint64_t g_clock_advances[2];
+/* Calls that each gate let through (index = kGates order), counted by the
+ * stubs themselves. SC6VRR_INPUT_TRACE logs them every second, to show how
+ * often each battle function really runs per battle step. */
+#define GATE_COUNT_MAX 16
+static volatile uint64_t g_gate_passes[GATE_COUNT_MAX];
 
 /* These measurements run on the engine thread. Read the battle counter at
  * frame boundaries instead of adding another detour to the simulation core. */
@@ -714,14 +719,18 @@ static double qpc_seconds(void) {
 }
 
 /* Entry stub: mov rax,&g_skip_battle; cmp byte [rax],0; jne skip;
- * mov rax,<trampoline>; jmp rax; skip: [xorps xmm0,xmm0;] ret.
- * Only rax (volatile, never an argument register) is touched, so the stub
- * works for any signature. */
-static uint8_t *make_gate_stub(uint8_t *mem, int returns_float, void ***tramp_slot) {
+ * mov rax,<counter>; lock inc qword [rax]; mov rax,<trampoline>; jmp rax;
+ * skip: [xorps xmm0,xmm0;] ret.
+ * Only rax (volatile, never an argument register) and the flags (not kept
+ * across calls) are touched, so the stub works for any arguments. A skip
+ * leaves rax undefined, so only void and float functions may be gated. */
+static uint8_t *make_gate_stub(uint8_t *mem, int returns_float, void ***tramp_slot, volatile uint64_t *counter) {
   uint8_t *p = mem;
   *p++ = 0x48; *p++ = 0xB8; *(uint64_t *)p = (uint64_t)(uintptr_t)&g_skip_battle; p += 8;
   *p++ = 0x80; *p++ = 0x38; *p++ = 0x00;
-  *p++ = 0x75; *p++ = 0x0C;
+  *p++ = 0x75; *p++ = 0x1A; /* to skip: 10 + 4 + 10 + 2 bytes */
+  *p++ = 0x48; *p++ = 0xB8; *(uint64_t *)p = (uint64_t)(uintptr_t)counter; p += 8;
+  *p++ = 0xF0; *p++ = 0x48; *p++ = 0xFF; *p++ = 0x00; /* lock inc qword [rax] */
   *p++ = 0x48; *p++ = 0xB8; *tramp_slot = (void **)p; *(uint64_t *)p = 0; p += 8;
   *p++ = 0xFF; *p++ = 0xE0;
   if (returns_float) { *p++ = 0x0F; *p++ = 0x57; *p++ = 0xC0; }
@@ -784,7 +793,7 @@ static int install_gates(void) {
   for (size_t i = 0; i < gate_count; i++) {
     void **tramp_slot;
     uint8_t *stub = p;
-    p = make_gate_stub(p, kGates[i].returns_float, &tramp_slot);
+    p = make_gate_stub(p, kGates[i].returns_float, &tramp_slot, &g_gate_passes[i < GATE_COUNT_MAX ? i : GATE_COUNT_MAX - 1]);
     void *trampoline = NULL;
     MH_STATUS st = MH_CreateHook(ADDR(kGates[i].addr), stub, &trampoline);
     if (st != MH_OK) {
@@ -1318,6 +1327,21 @@ static void hook_update_time(void *self) {
               input_stats.before_world, input_stats.in_world, input_stats.after_world, input_stats.other_thread, input_stats.world_ticks,
               input_stats.presses, input_stats.buttons, input_stats.on_step, input_stats.not_due, input_stats.latched, input_in_battle, input_online, cfg_early_step);
       memset(&input_stats, 0, sizeof(input_stats));
+      if (cfg_input_trace && input_in_battle) {
+        static uint64_t last_passes[GATE_COUNT_MAX];
+        char line[512];
+        size_t used = 0;
+        for (size_t i = 0; i < sizeof(kGates) / sizeof(kGates[0]) && i < GATE_COUNT_MAX; i++) {
+          uint64_t n = g_gate_passes[i];
+          used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%s=%llu", i ? " " : "",
+                                   strchr(kGates[i].name, ' ') ? strchr(kGates[i].name, ' ') + 1 : kGates[i].name,
+                                   (unsigned long long)(n - last_passes[i]));
+          last_passes[i] = n;
+          if (used >= sizeof(line))
+            break;
+        }
+        log_msg("trace gates per second: %s", line);
+      }
     } else {
       log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, cfg_gate ? steps : frames,
               now - window_start);
