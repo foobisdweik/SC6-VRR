@@ -260,3 +260,12 @@ Checked on 2026-10-17 with `open` on the outer app:
 
 Direct presentation was not rechecked with this build, because the HUD is off. Its presentation settings match the run in which the user saw `Direct`.
 Quit FineTune and BetterDisplay before playing.
+
+## Starting the game from the SC6-FEX app (2026-11-01)
+
+The normal way to start the game is `~/Applications/CrossOver/SoulcaliburVI (Game Mode) (SC6-FEX).app`. No shell script is needed for that:
+
+- The SC6-FEX bottle links `C:\Games\SoulCalibur 6` to the SC6-Rosetta game folder. So the app loads the same `dinput8.dll` and reads the same `sc6vrr.ini` as every other launch.
+- The bottle loads the native `dinput8.dll` for `SoulcaliburVI.exe` (per-app DLL override in `user.reg`).
+- The LaunchAgent `local.sc6vrr.apply-ini` copies the `[launch]` section of `sc6vrr.ini` into the bottle's `cxbottle.conf` whenever the ini changes.
+- The LaunchAgent `local.sc6vrr.install-dll` runs `dll/sync-dll.sh` whenever `dll/build/dinput8.dll` changes and at login. The script installs the new build into the game folder; if the game is running, it waits until the game exits. It keeps the old DLL as `dinput8.dll.previous` and never replaces a `dinput8.dll` that is not the sc6vrr proxy. Log: `~/Library/Logs/sc6vrr-install-dll.log`.

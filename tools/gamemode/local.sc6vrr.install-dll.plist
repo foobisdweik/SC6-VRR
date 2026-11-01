@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Installs each new sc6vrr build into the game folder (dll/sync-dll.sh), so
+     the CrossOver app launches always load the current DLL. Install:
+       cp tools/gamemode/local.sc6vrr.install-dll.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.sc6vrr.install-dll.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.sc6vrr.install-dll</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/iphoobis/Projects/SC6-VRR/dll/sync-dll.sh</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+    <string>/Users/iphoobis/Projects/SC6-VRR/dll/build/dinput8.dll</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/iphoobis/Library/Logs/sc6vrr-install-dll.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/iphoobis/Library/Logs/sc6vrr-install-dll.log</string>
+</dict>
+</plist>
