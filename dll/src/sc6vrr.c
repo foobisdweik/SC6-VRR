@@ -31,6 +31,9 @@
  *   SC6VRR_SKIP_GS_DRAWS=1 drops geometry-shader draws, for GPU profiling only.
  *   SC6VRR_FRAME_MODS=1 is required for every engine hook above (uncap, gate,
  *   measure). Without it, the DLL changes no frame timing.
+ *   SC6VRR_INPUT_LATCH=1 and SC6VRR_EARLY_STEP=1 (need the gate) use the pad
+ *   reads of the frames between battle steps; see "controller input between
+ *   battle steps".
  */
 #include <windows.h>
 #include <bcrypt.h>
@@ -964,17 +967,163 @@ static int install_frame_timers(void) {
   return 1;
 }
 
+/* ---------- controller input between battle steps ------------------------ */
+/* The battle reads the buttons once per 60 Hz step. For each step, its
+ * catch-up loop (0x1403FE520) takes one recorded button word per player
+ * (FUN_1403fcd10), and "pressed" is (previous word ^ this word) & this word,
+ * so it compares two step samples. UE4 reads the pad with XInputGetState once
+ * per engine frame (120 times per second at 120 fps), but the battle only uses
+ * the reads on frames that run a step. Two options use the other frames:
+ *  - SC6VRR_INPUT_LATCH=1: a button that goes down is reported as held until
+ *    a battle step has run. A tap that ends between two steps therefore still
+ *    reaches the battle, as a press of one step.
+ *  - SC6VRR_EARLY_STEP=1: when a new button press arrives on a frame without
+ *    a step, and the step is due on the next frame, the step runs on this
+ *    frame instead. The press reaches the battle one frame sooner (8.3 ms at
+ *    120 fps). The next step then waits one frame longer. So the battle still
+ *    runs 60 steps per second, and each step still reads one input: frame
+ *    counts (parry windows, hitstun, move lengths) do not change. Only face
+ *    buttons, shoulder buttons, triggers and stick clicks start an early step.
+ *    Directions do not, so walking and motion inputs keep the regular rhythm.
+ *    It is off in online matches and outside battles. F5 toggles it.
+ * Both need SC6VRR_GATE=1. The early step works only if UE4 reads the pad on
+ * the game thread after UpdateTimeAndHandleMaxTickRate and before UWorld::Tick
+ * (where the battle runs). The DLL counts where each read happens and logs it
+ * every second, and it starts no early step from a read anywhere else. */
+#define ADDR_ONLINE_CHECK 0x1403f2590ull /* ALuxBattleManager_CheckOnlineSessionActive, no arguments */
+static volatile LONG64 g_frames; /* engine frames, counted in the UpdateTime hooks */
+#define GATE_STEP (1.0 / 60.0)
+#define XI_LT 0x0400       /* two wButtons bits that XInput leaves unused: the DLL's trigger flags */
+#define XI_RT 0x0800
+#define XI_TRIGGER_DOWN 30 /* XINPUT_GAMEPAD_TRIGGER_THRESHOLD */
+#define XI_EARLY_MASK 0xFFC0 /* A B X Y, shoulders, triggers, stick clicks; not the D-pad, Start or Back */
+
+typedef struct {
+  DWORD packet;
+  WORD buttons;
+  BYTE left_trigger, right_trigger;
+  SHORT thumbs[4];
+} sc6_xinput_state; /* XINPUT_STATE */
+typedef DWORD(WINAPI *xinput_get_state_fn)(DWORD user, sc6_xinput_state *state);
+static xinput_get_state_fn orig_xinput_get_state;
+static int cfg_input_latch, cfg_early_step, early_step_available;
+static DWORD input_engine_thread; /* the thread that runs UpdateTime */
+static int input_phase;           /* 1 = after UpdateTime, 2 = inside UWorld::Tick, 0 = after it */
+static int input_in_battle, input_online;
+static double gate_acc, gate_last_dt; /* step accumulator (seconds) and the last engine frame time */
+static WORD xi_last[4], xi_sticky[4]; /* per pad: buttons at the last read, and buttons latched down */
+static struct {
+  unsigned reads, before_world, in_world, after_world, other_thread, presses, latched, early, world_ticks;
+} input_stats;
+
+/* Runs in place of the exe's import of XInputGetState (XINPUT1_3 ordinal 2). */
+static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
+  DWORD r = orig_xinput_get_state(user, st);
+  if (GetCurrentThreadId() != input_engine_thread) {
+    input_stats.other_thread++; /* left unchanged: the per-pad state belongs to the game thread */
+    return r;
+  }
+  int phase = input_phase;
+  input_stats.reads++;
+  if (phase == 1)
+    input_stats.before_world++;
+  else if (phase == 2)
+    input_stats.in_world++;
+  else
+    input_stats.after_world++;
+  if (r != ERROR_SUCCESS || user >= 4 || !st)
+    return r;
+  WORD b = st->buttons & ~(XI_LT | XI_RT);
+  if (st->left_trigger > XI_TRIGGER_DOWN)
+    b |= XI_LT;
+  if (st->right_trigger > XI_TRIGGER_DOWN)
+    b |= XI_RT;
+  WORD down = b & ~xi_last[user];
+  xi_last[user] = b;
+  if (down)
+    input_stats.presses++;
+  if (cfg_input_latch) {
+    xi_sticky[user] |= down;
+    WORD extra = xi_sticky[user] & ~b; /* released again before a step read it */
+    if (extra) {
+      input_stats.latched++;
+      st->buttons |= extra & ~(XI_LT | XI_RT);
+      if (extra & XI_LT)
+        st->left_trigger = 255;
+      if (extra & XI_RT)
+        st->right_trigger = 255;
+    }
+  }
+  /* The step that the accumulator would release on the next frame runs now.
+   * The accumulator keeps the debt, so the next scheduled step comes one
+   * frame later and the long-run rate stays 60 per second. */
+  if (cfg_early_step && early_step_available && (down & XI_EARLY_MASK) && phase == 1 && g_skip_battle &&
+      input_in_battle && !input_online && gate_acc + gate_last_dt >= GATE_STEP - 0.0005) {
+    /* 0.5 ms of slack: at 120 fps the two sides are nearly equal, and
+     * timer jitter would otherwise block about half of the early steps. */
+    gate_acc -= GATE_STEP;
+    g_skip_battle = 0;
+    input_stats.early++;
+  }
+  return r;
+}
+
+/* Runs on the game thread once per frame, after the gate decision. */
+static void input_frame(void) {
+  input_engine_thread = GetCurrentThreadId();
+  input_phase = 1;
+  if (!orig_xinput_get_state)
+    return;
+  static int f5_was_down;
+  int f5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
+  if (f5 && !f5_was_down && early_step_available) {
+    cfg_early_step = !cfg_early_step;
+    log_msg("live: F5: SC6VRR_EARLY_STEP=%d", cfg_early_step);
+  }
+  f5_was_down = f5;
+  /* In a battle = the battle frame counter moved during the last 30 engine
+   * frames. The game calls the online check itself on every battle step, so
+   * the DLL calls it only then, and at most every 30 frames. */
+  static uint32_t last_counter;
+  static LONG64 last_change, last_check;
+  static int primed;
+  uint32_t c = *(volatile uint32_t *)ADDR(ADDR_BATTLE_COUNTER);
+  if (!primed)
+    primed = 1;
+  else if (c != last_counter)
+    last_change = g_frames;
+  last_counter = c;
+  int in_battle = last_change && g_frames - last_change < 30;
+  if (in_battle && early_step_available && g_frames - last_check >= 30) {
+    last_check = g_frames;
+    int online = ((char (*)(void))ADDR(ADDR_ONLINE_CHECK))() != 0;
+    if (online != input_online)
+      log_msg("input: online session %s; early steps %s", online ? "active" : "ended", online ? "off" : "allowed");
+    input_online = online;
+  }
+  if (in_battle != input_in_battle)
+    log_msg("input: battle %s", in_battle ? "running" : "not running");
+  input_in_battle = in_battle;
+}
+
 static void hook_world_tick(void *world, int tick_type, float delta) {
+  int engine = GetCurrentThreadId() == input_engine_thread;
+  if (engine) {
+    input_phase = 2;
+    input_stats.world_ticks++; /* shows that the phase marks work */
+  }
   if (!cfg_measure || GetCurrentThreadId() != measurements.engine_thread) {
     orig_world_tick(world, tick_type, delta);
-    return;
+  } else {
+    double start = qpc_seconds();
+    orig_world_tick(world, tick_type, delta);
+    double elapsed_ms = (qpc_seconds() - start) * 1000.0;
+    sc6_duration_add(&measurements.world, elapsed_ms);
+    if (inside_measured_frame())
+      sc6_duration_add(&frame_timers.world, elapsed_ms);
   }
-  double start = qpc_seconds();
-  orig_world_tick(world, tick_type, delta);
-  double elapsed_ms = (qpc_seconds() - start) * 1000.0;
-  sc6_duration_add(&measurements.world, elapsed_ms);
-  if (inside_measured_frame())
-    sc6_duration_add(&frame_timers.world, elapsed_ms);
+  if (engine)
+    input_phase = 0;
 }
 
 static void measure_frame(double now, double timing_start) {
@@ -1044,7 +1193,6 @@ static float hook_get_max_tick_rate(void *self, float delta, BOOL allow_smoothin
 }
 
 static void title_tick(void); /* SC6VRR_SKIP_TITLE; defined with the title skip */
-static volatile LONG64 g_frames; /* engine frames, counted in the UpdateTime hooks */
 
 static void hook_update_time(void *self) {
   double timing_start = cfg_measure ? qpc_seconds() : 0.0;
@@ -1052,9 +1200,8 @@ static void hook_update_time(void *self) {
   g_frames++;
   title_tick();
 
-  static double last, acc, window_start;
+  static double last, window_start;
   static unsigned frames, steps;
-  const double step = 1.0 / 60.0;
   double now = qpc_seconds();
   if (cfg_measure)
     measure_frame(now, timing_start);
@@ -1066,20 +1213,37 @@ static void hook_update_time(void *self) {
   last = now;
 
   if (cfg_gate) {
-    acc += dt;
-    if (acc > 0.1) /* after a long hitch, do not try to catch up */
-      acc = 0.1;
-    if (acc >= step) {
-      acc -= step;
+    /* The frame that just ended ran a battle step (scheduled or early), and
+     * that step has read the latched buttons. */
+    if (!g_skip_battle)
+      memset(xi_sticky, 0, sizeof(xi_sticky));
+    gate_acc += dt;
+    if (gate_acc > 0.1) /* after a long hitch, do not try to catch up */
+      gate_acc = 0.1;
+    if (gate_acc >= GATE_STEP) {
+      gate_acc -= GATE_STEP;
       g_skip_battle = 0;
       steps++;
     } else {
       g_skip_battle = 1;
     }
   }
+  gate_last_dt = dt;
+  input_frame();
   frames++;
   if (now - window_start >= 1.0) {
-    log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, cfg_gate ? steps : frames, now - window_start);
+    if (orig_xinput_get_state) {
+      log_msg("frames=%u steps=%u (%u early) (%.6f s); pad reads=%u (after UpdateTime %u, in world tick %u, "
+              "after world tick %u, other threads %u) world_ticks=%u presses=%u latched_reads=%u battle=%d online=%d "
+              "early_step=%d",
+              frames, steps + input_stats.early, input_stats.early, now - window_start, input_stats.reads,
+              input_stats.before_world, input_stats.in_world, input_stats.after_world, input_stats.other_thread, input_stats.world_ticks,
+              input_stats.presses, input_stats.latched, input_in_battle, input_online, cfg_early_step);
+      memset(&input_stats, 0, sizeof(input_stats));
+    } else {
+      log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, cfg_gate ? steps : frames,
+              now - window_start);
+    }
     frames = steps = 0;
     window_start = now;
   }
@@ -3917,6 +4081,51 @@ static void *patch_exe_import(const char *dll, const char *name, void *replaceme
   return NULL;
 }
 
+/* Like patch_exe_import, for an import by ordinal number (the exe imports
+ * XINPUT1_3.dll that way). */
+static void *patch_exe_import_ordinal(const char *dll, WORD ordinal, void *replacement) {
+  uint8_t *base = (uint8_t *)GetModuleHandleW(NULL);
+  IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+  IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; d++) {
+    if (_stricmp((char *)(base + d->Name), dll))
+      continue;
+    IMAGE_THUNK_DATA64 *names = (IMAGE_THUNK_DATA64 *)(base + d->OriginalFirstThunk);
+    IMAGE_THUNK_DATA64 *slots = (IMAGE_THUNK_DATA64 *)(base + d->FirstThunk);
+    for (; names->u1.AddressOfData; names++, slots++) {
+      if (!IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal) || IMAGE_ORDINAL64(names->u1.Ordinal) != ordinal)
+        continue;
+      DWORD old;
+      void *previous = (void *)slots->u1.Function;
+      if (!previous || !VirtualProtect(&slots->u1.Function, 8, PAGE_READWRITE, &old))
+        return NULL;
+      slots->u1.Function = (ULONGLONG)replacement;
+      VirtualProtect(&slots->u1.Function, 8, old, &old);
+      return previous;
+    }
+  }
+  return NULL;
+}
+
+/* SC6VRR_INPUT_LATCH and SC6VRR_EARLY_STEP (see "controller input between
+ * battle steps"). world_hooked = the UWorld::Tick hook is in, so the DLL can
+ * tell whether a pad read comes before the battle runs. */
+static void install_input(int world_hooked) {
+  void *previous = patch_exe_import_ordinal("XINPUT1_3.dll", 2, (void *)hook_xinput_get_state);
+  if (!previous) {
+    log_msg("input: XInputGetState import not found; SC6VRR_INPUT_LATCH and SC6VRR_EARLY_STEP off");
+    cfg_input_latch = cfg_early_step = 0;
+    return;
+  }
+  orig_xinput_get_state = (xinput_get_state_fn)previous;
+  early_step_available = world_hooked && bytes_match(ADDR(ADDR_ONLINE_CHECK), "4057" "4883ec30" "488d4c2420e8");
+  if (!early_step_available)
+    cfg_early_step = 0;
+  log_msg("input: XInputGetState hooked; latch=%d early_step=%d (%s)", cfg_input_latch, cfg_early_step,
+          early_step_available ? "F5 toggles it"
+                               : "unavailable: no UWorld::Tick hook or online check mismatch");
+}
+
 /* SC6VRR_FAST_CRT: x86 versions of the next most-called imports (counts
  * from SC6VRR_COUNT_IMPORTS for one boot to the main menu, 2026-10-31):
  * memcpy 43.7 M, GetCurrentThreadId 19.4 M, toupper 17.8 M, memset 5.8 M,
@@ -4648,6 +4857,19 @@ static void setup(void) {
     log_msg("sc6vrr: gating and measurement disabled");
     cfg_gate = 0;
     cfg_measure = 0;
+  }
+  cfg_input_latch = env_int("SC6VRR_INPUT_LATCH", 0);
+  cfg_early_step = env_int("SC6VRR_EARLY_STEP", 0);
+  if ((cfg_input_latch || cfg_early_step) && !cfg_gate) {
+    log_msg("input: SC6VRR_INPUT_LATCH and SC6VRR_EARLY_STEP need SC6VRR_GATE=1; both off");
+    cfg_input_latch = cfg_early_step = 0;
+  } else if (cfg_input_latch || cfg_early_step) {
+    /* The early step must know where each pad read falls in the frame, so it
+     * needs the UWorld::Tick hook, which measurement may already have made. */
+    int world_hooked = orig_world_tick != NULL;
+    if (!world_hooked && bytes_match(ADDR(ADDR_WORLD_TICK), "488bc455535657415441554156415748"))
+      world_hooked = MH_CreateHook(ADDR(ADDR_WORLD_TICK), hook_world_tick, (void **)&orig_world_tick) == MH_OK;
+    install_input(world_hooked);
   }
   if (cfg_frame_timers && (!cfg_measure || !install_frame_timers())) {
     cfg_frame_timers = 0;
