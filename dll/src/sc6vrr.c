@@ -4967,8 +4967,8 @@ static void setup(void) {
     cfg_gate = 0;
     cfg_measure = 0;
   }
-  cfg_input_latch = env_int("SC6VRR_INPUT_LATCH", 0);
-  cfg_early_step = env_int("SC6VRR_EARLY_STEP", 0);
+  cfg_input_latch = env_int("SC6VRR_INPUT_LATCH", 1);
+  cfg_early_step = env_int("SC6VRR_EARLY_STEP", 1);
   cfg_input_trace = env_int("SC6VRR_INPUT_TRACE", 0);
   if ((cfg_input_latch || cfg_early_step) && !cfg_gate) {
     log_msg("input: SC6VRR_INPUT_LATCH and SC6VRR_EARLY_STEP need SC6VRR_GATE=1; both off");
