@@ -1013,7 +1013,7 @@ static int input_in_battle, input_online;
 static double gate_acc, gate_last_dt; /* step accumulator (seconds) and the last engine frame time */
 static WORD xi_last[4], xi_sticky[4]; /* per pad: buttons at the last read, and buttons latched down */
 static struct {
-  unsigned reads, before_world, in_world, after_world, other_thread, presses, latched, early, world_ticks;
+  unsigned reads, before_world, in_world, after_world, other_thread, presses, latched, early, world_ticks, buttons, on_step, not_due;
 } input_stats;
 
 /* Runs in place of the exe's import of XInputGetState (XINPUT1_3 ordinal 2). */
@@ -1057,8 +1057,16 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
   /* The step that the accumulator would release on the next frame runs now.
    * The accumulator keeps the debt, so the next scheduled step comes one
    * frame later and the long-run rate stays 60 per second. */
+  int due = gate_acc + gate_last_dt >= GATE_STEP - 0.0005;
+  if ((down & XI_EARLY_MASK) && input_in_battle) {
+    input_stats.buttons++; /* face, shoulder and trigger presses in a battle */
+    if (!g_skip_battle)
+      input_stats.on_step++; /* this frame runs a step anyway */
+    else if (!due)
+      input_stats.not_due++; /* the next step is more than one frame away */
+  }
   if (cfg_early_step && early_step_available && (down & XI_EARLY_MASK) && phase == 1 && g_skip_battle &&
-      input_in_battle && !input_online && gate_acc + gate_last_dt >= GATE_STEP - 0.0005) {
+      input_in_battle && !input_online && due) {
     /* 0.5 ms of slack: at 120 fps the two sides are nearly equal, and
      * timer jitter would otherwise block about half of the early steps. */
     gate_acc -= GATE_STEP;
@@ -1234,11 +1242,11 @@ static void hook_update_time(void *self) {
   if (now - window_start >= 1.0) {
     if (orig_xinput_get_state) {
       log_msg("frames=%u steps=%u (%u early) (%.6f s); pad reads=%u (after UpdateTime %u, in world tick %u, "
-              "after world tick %u, other threads %u) world_ticks=%u presses=%u latched_reads=%u battle=%d online=%d "
+              "after world tick %u, other threads %u) world_ticks=%u presses=%u (buttons %u: %u on step frames, %u with no step due) latched_reads=%u battle=%d online=%d "
               "early_step=%d",
               frames, steps + input_stats.early, input_stats.early, now - window_start, input_stats.reads,
               input_stats.before_world, input_stats.in_world, input_stats.after_world, input_stats.other_thread, input_stats.world_ticks,
-              input_stats.presses, input_stats.latched, input_in_battle, input_online, cfg_early_step);
+              input_stats.presses, input_stats.buttons, input_stats.on_step, input_stats.not_due, input_stats.latched, input_in_battle, input_online, cfg_early_step);
       memset(&input_stats, 0, sizeof(input_stats));
     } else {
       log_msg("frames=%u steps=%u (%.6f s); steps are scheduler decisions", frames, cfg_gate ? steps : frames,
