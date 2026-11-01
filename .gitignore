@@ -27,3 +27,4 @@ __pycache__/
 # Local Ghidra project files (machine-specific)
 /SC6-Apple.gpr
 /SC6-Apple.lock*
+tools/pad-watch/pad-watch
