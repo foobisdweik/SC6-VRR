@@ -32,7 +32,6 @@
  *   SC6VRR_FRAME_MODS=1 is required for every engine hook above (uncap, gate,
  *   measure). Without it, the DLL changes no frame timing.
  */
-#include <winsock2.h> /* before windows.h, which would pull in the old winsock.h */
 #include <windows.h>
 #include <bcrypt.h>
 #include <d3d11.h>
@@ -3342,22 +3341,12 @@ static create_swapchain_fn orig_create_swapchain;
 static present_fn orig_present;
 static volatile LONG factory_hooked, present_hooked;
 
-static void hdr_badge_present(void *swapchain); /* HDR watermark, below */
-static HRESULT last_present_hr = S_OK;          /* checked by the HDR watermark */
-
 static HRESULT WINAPI hook_present(void *swapchain, UINT sync_interval, UINT flags) {
-  /* The frame log and the tools below exist only with SC6VRR_SHADER_DIR; the
-   * HDR watermark can install this hook without it. */
-  if (shader_dir[0]) {
-    frame_present();
-    waits_present();
-    gpu_pass_present();
-    prepass_present();
-  }
-  hdr_badge_present(swapchain);
-  HRESULT hr = orig_present(swapchain, sync_interval, flags);
-  last_present_hr = hr;
-  return hr;
+  frame_present();
+  waits_present();
+  gpu_pass_present();
+  prepass_present();
+  return orig_present(swapchain, sync_interval, flags);
 }
 
 static void hook_swapchain(void *swapchain) {
@@ -3403,10 +3392,7 @@ static HRESULT WINAPI hook_create_factory1(REFIID riid, void **factory) {
 }
 
 /* Takes the two export addresses as arguments so that the test can pass fakes. */
-static int frame_log_installed;
 static int install_frame_log(void *create_factory, void *create_factory1) {
-  if (frame_log_installed)
-    return 1;
   int hooked = 0;
   if (create_factory && MH_CreateHook(create_factory, hook_create_factory, (void **)&orig_create_factory) == MH_OK &&
       MH_EnableHook(create_factory) == MH_OK)
@@ -3416,7 +3402,6 @@ static int install_frame_log(void *create_factory, void *create_factory1) {
       MH_EnableHook(create_factory1) == MH_OK)
     hooked++;
   log_msg("frames: %d factory creation hooks installed; press F10 in the game to log one frame", hooked);
-  frame_log_installed = hooked > 0;
   return hooked > 0;
 }
 
@@ -3717,396 +3702,6 @@ static void install_hdr(void) {
   if (st == MH_OK)
     st = MH_EnableHook(ADDR(ADDR_ENABLE_HDR));
   log_msg("hdr: EnableHDRDisplayOutput hook %s (%d)", st == MH_OK ? "installed" : "failed", st);
-}
-
-/* ---------- HDR watermark ------------------------------------------------- */
-/* SC6VRR_HDR_BADGE=1 copies a small "HDR" badge into the bottom-right corner
- * of each frame, but only while every part of the presentation chain reports
- * HDR as active and without errors. A part that cannot report counts as a
- * failure. The checks run every HDR_BADGE_CHECK_FRAMES presents:
- *   1. Game (UE4): GRHISupportsHDROutput is set, r.HDR.EnableHDROutput = 1,
- *      r.HDR.Display.OutputDevice = 5 or 6 (scRGB), ColorGamut = 2 (Rec2020).
- *   2. DXGI (DXMT's swap chain): the back buffer is R16G16B16A16_FLOAT, and
- *      the previous Present returned S_OK.
- *   3. DXMT presenter (the SC6 fork's d3d11.dll export
- *      DXMT_SC6_GetPresentStatus): the layer color space is scRGB and the call
- *      that set it succeeded; the CAMetalLayer's own pixel format (read back
- *      from the layer) is RGBA16Float; presents got drawables since the last
- *      check, and none failed.
- *   4. macOS (the NSScreen of the game window, which DXMT reads): the current
- *      EDR headroom (how many times brighter than SDR white the screen may
- *      show now) is at least SC6VRR_HDR_BADGE_MIN_HEADROOM. macOS reports
- *      more than 1.0 only for a layer that asks for EDR and gets it. The
- *      current headroom must also be settled (changed by less than 2% since
- *      the last check). DXMT multiplies scRGB by 0.8 * current / potential,
- *      and macOS settles current at (panel peak / SDR white), so a settled
- *      value shows scRGB 1.0 at 80 nits whatever the SDR brightness. While
- *      macOS ramps the headroom (about 2.5 s after the window gets focus or
- *      the brightness changes), the picture is darker than intended.
- *   5. BetterDisplay (its HTTP API, read every 2 s by a helper thread): the
- *      display is connected and uses an HDR preset. Empty
- *      SC6VRR_BETTERDISPLAY skips this check.
- * The text is drawn at the screen's current peak brightness, so with working
- * HDR it looks brighter than the game's white UI text. */
-#define HDR_BADGE_CHECK_FRAMES 30
-static float badge_last_current; /* EDR headroom at the previous check */
-#define DXGI_FORMAT_FP16 10          /* DXGI_FORMAT_R16G16B16A16_FLOAT */
-#define WMT_COLORSPACE_SCRGB 5       /* WMTColorSpaceHDR_scRGB */
-#define WMT_PIXEL_FORMAT_RGBA16F 115 /* WMTPixelFormatRGBA16Float */
-/* IConsoleObject::AsVariableInt returns TConsoleVariableData<int32>, whose
- * second int is the render-thread copy. The game's renderer reads the HDR
- * variables this way (for example in the function that checks
- * GRHISupportsHDROutput and r.HDR.UI.CompositeMode). */
-#define CVAR_AS_INT_SLOT (0x38 / 8)
-#define CVAR_RENDER_VALUE_OFFSET 4
-#define ADDR_HDR_CVAR_ENABLE_SETTINGS 0x144396e80ull /* r.HDR.EnableHDROutput, cached by the settings loader */
-
-/* Same layout as DXMTSC6PresentStatus in the fork's dxmt_presenter.hpp. */
-struct sc6_dxmt_status {
-  uint32_t size, colorspace, source_format, layer_pixel_format, colorspace_ok, drawable_failures;
-  float edr_current, edr_potential;
-  uint64_t frames, drawables;
-};
-typedef uint32_t(WINAPI *dxmt_status_fn)(struct sc6_dxmt_status *out, uint32_t size);
-typedef void *(*cvar_as_int_fn)(void *cvar);
-
-static int cfg_hdr_badge;
-static float badge_min_headroom = 1.5f;
-static dxmt_status_fn badge_dxmt_status;
-static unsigned badge_frame;
-static int badge_show;
-static uint64_t badge_last_drawables, badge_last_failures;
-static int badge_have_baseline;
-static char badge_last_reason[512];
-static float badge_peak = 1.0f; /* the screen's current EDR peak, from the last check */
-
-/* BetterDisplay state, written by the helper thread. */
-static SRWLOCK bd_lock = SRWLOCK_INIT;
-static int bd_enabled, bd_ok;
-static ULONGLONG bd_time; /* GetTickCount64 of the last answer */
-static char bd_reason[160];
-static char bd_display_query[200], bd_token[64];
-static struct sockaddr_in bd_addr;
-
-static ID3D11Texture2D *badge_tex;
-static UINT badge_w, badge_h, badge_scale, badge_for_height;
-static float badge_tex_value;
-static const GUID sc6_IID_ID3D11Texture2D = {0x6f15aaf2, 0xd208, 0x4e89, {0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}};
-
-/* One BetterDisplay GET. Returns 1 for HTTP 200 with a usable body (trimmed
- * into out); BetterDisplay answers "Failed." for an unknown feature. */
-static int bd_get(const char *feature, char *out, size_t out_size) {
-  SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (s == INVALID_SOCKET)
-    return 0;
-  DWORD timeout_ms = 1000;
-  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
-  char buf[2048];
-  int len = 0, r;
-  if (connect(s, (struct sockaddr *)&bd_addr, sizeof(bd_addr)) == 0) {
-    int n = snprintf(buf, sizeof(buf),
-                     "GET /get?%s&%s&token=%s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-                     bd_display_query, feature, bd_token);
-    if (send(s, buf, n, 0) == n)
-      while (len < (int)sizeof(buf) - 1 && (r = recv(s, buf + len, (int)sizeof(buf) - 1 - len, 0)) > 0)
-        len += r;
-  }
-  closesocket(s);
-  buf[len] = 0;
-  char *body = strstr(buf, "\r\n\r\n");
-  if (strncmp(buf, "HTTP/1.", 7) || strncmp(buf + 8, " 200", 4) || !body)
-    return 0;
-  body += 4;
-  size_t blen = strlen(body);
-  while (blen && (body[blen - 1] == '\r' || body[blen - 1] == '\n' || body[blen - 1] == ' '))
-    body[--blen] = 0;
-  if (!blen || !strncmp(body, "Failed", 6))
-    return 0;
-  snprintf(out, out_size, "%s", body);
-  return 1;
-}
-
-static DWORD WINAPI bd_thread(void *unused) {
-  (void)unused;
-  WSADATA wsa;
-  if (WSAStartup(MAKEWORD(2, 2), &wsa)) {
-    AcquireSRWLockExclusive(&bd_lock);
-    snprintf(bd_reason, sizeof(bd_reason), "BetterDisplay: WSAStartup failed");
-    ReleaseSRWLockExclusive(&bd_lock);
-    return 0;
-  }
-  for (;;) {
-    char connected[64] = "", preset[128] = "", reason[160] = "";
-    int ok = 0;
-    if (!bd_get("connected", connected, sizeof(connected)))
-      snprintf(reason, sizeof(reason), "BetterDisplay: no answer (not running, wrong port or token, or display name)");
-    else if (strcmp(connected, "on"))
-      snprintf(reason, sizeof(reason), "BetterDisplay: display connected = %s", connected);
-    else if (!bd_get("xdrPreset", preset, sizeof(preset)))
-      snprintf(reason, sizeof(reason), "BetterDisplay: no preset answer");
-    /* The Apple presets with an HDR transfer function. */
-    else if (strncmp(preset, "Apple XDR Display", 17) && strncmp(preset, "Pro Display XDR", 15) &&
-             strncmp(preset, "HDR Video", 9))
-      snprintf(reason, sizeof(reason), "BetterDisplay: preset \"%s\" is not an HDR preset", preset);
-    else {
-      ok = 1;
-      snprintf(reason, sizeof(reason), "preset \"%s\"", preset);
-    }
-    AcquireSRWLockExclusive(&bd_lock);
-    bd_ok = ok;
-    bd_time = GetTickCount64();
-    memcpy(bd_reason, reason, sizeof(bd_reason));
-    ReleaseSRWLockExclusive(&bd_lock);
-    Sleep(2000);
-  }
-}
-
-static void hdr_badge_setup(void) {
-  char buf[256];
-  cfg_hdr_badge = 1;
-  if (cfg_str("SC6VRR_HDR_BADGE_MIN_HEADROOM", buf, sizeof(buf)) && atof(buf) > 1.0)
-    badge_min_headroom = (float)atof(buf);
-  HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
-  badge_dxmt_status = d3d11 ? (dxmt_status_fn)GetProcAddress(d3d11, "DXMT_SC6_GetPresentStatus") : NULL;
-  /* SC6VRR_BETTERDISPLAY = "address:port" of BetterDisplay's HTTP server. */
-  if (cfg_str("SC6VRR_BETTERDISPLAY", buf, sizeof(buf))) {
-    char *colon = strchr(buf, ':');
-    bd_addr.sin_family = AF_INET;
-    bd_addr.sin_port = htons((u_short)(colon ? atoi(colon + 1) : 55777));
-    if (colon)
-      *colon = 0;
-    bd_addr.sin_addr.s_addr = inet_addr(buf);
-    cfg_str("SC6VRR_BETTERDISPLAY_TOKEN", bd_token, sizeof(bd_token));
-    char name[128];
-    if (!cfg_str("SC6VRR_BETTERDISPLAY_DISPLAY", name, sizeof(name)))
-      strcpy(name, "Built-in Display");
-    /* URL-encode the display name for the query. */
-    size_t o = (size_t)snprintf(bd_display_query, sizeof(bd_display_query), "name=");
-    for (const char *c = name; *c && o + 4 < sizeof(bd_display_query); c++) {
-      if ((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-' || *c == '_')
-        bd_display_query[o++] = *c;
-      else
-        o += (size_t)snprintf(bd_display_query + o, 4, "%%%02X", (unsigned char)*c);
-    }
-    bd_display_query[o] = 0;
-    snprintf(bd_reason, sizeof(bd_reason), "BetterDisplay: no answer yet");
-    bd_enabled = 1;
-    HANDLE t = CreateThread(NULL, 0, bd_thread, NULL, 0, NULL);
-    if (t)
-      CloseHandle(t);
-  }
-  log_msg("hdr badge: on; DXMT status export %s; BetterDisplay %s (%s); minimum headroom %.2f",
-          badge_dxmt_status ? "found" : "MISSING (needs the SC6 DXMT build)", bd_enabled ? "checked" : "not checked",
-          bd_display_query, badge_min_headroom);
-}
-
-static int badge_cvar(uint64_t slot, int *value) {
-  void *cvar = *(void **)ADDR(slot);
-  if (!cvar)
-    return 0;
-  uint8_t *data = ((cvar_as_int_fn)(*(void ***)cvar)[CVAR_AS_INT_SLOT])(cvar);
-  if (!data)
-    return 0;
-  *value = *(volatile int *)(data + CVAR_RENDER_VALUE_OFFSET);
-  return 1;
-}
-
-#define BADGE_FAIL(...)                                                                          \
-  do {                                                                                           \
-    if (used < reason_size)                                                                      \
-      used += (size_t)snprintf(reason + used, reason_size - used, "%s", used ? "; " : "");      \
-    if (used < reason_size)                                                                      \
-      used += (size_t)snprintf(reason + used, reason_size - used, __VA_ARGS__);                 \
-  } while (0)
-
-/* Runs every check; returns 1 only if all pass. reason lists every failure. */
-static int badge_check(IDXGISwapChain *sc, char *reason, size_t reason_size) {
-  size_t used = 0;
-  /* 1. Game */
-  int on = -1, device = -1, gamut = -1;
-  if (!*(volatile uint8_t *)ADDR(ADDR_RHI_SUPPORTS_HDR))
-    BADGE_FAIL("game: GRHISupportsHDROutput is 0");
-  if (!badge_cvar(ADDR_HDR_CVAR_ENABLE, &on) && !badge_cvar(ADDR_HDR_CVAR_ENABLE_SETTINGS, &on))
-    BADGE_FAIL("game: r.HDR.EnableHDROutput not found");
-  else if (on != 1)
-    BADGE_FAIL("game: r.HDR.EnableHDROutput = %d", on);
-  if (!badge_cvar(ADDR_HDR_CVAR_DEVICE, &device) || !badge_cvar(ADDR_HDR_CVAR_GAMUT, &gamut))
-    BADGE_FAIL("game: HDR output settings not found (EnableHDRDisplayOutput never ran)");
-  else {
-    if (device != 5 && device != 6)
-      BADGE_FAIL("game: r.HDR.Display.OutputDevice = %d (needs 5 or 6, scRGB)", device);
-    if (gamut != 2)
-      BADGE_FAIL("game: r.HDR.Display.ColorGamut = %d (needs 2, Rec2020)", gamut);
-  }
-  /* 2. DXGI */
-  DXGI_SWAP_CHAIN_DESC desc;
-  if (FAILED(sc->lpVtbl->GetDesc(sc, &desc)))
-    BADGE_FAIL("DXGI: GetDesc failed");
-  else if (desc.BufferDesc.Format != DXGI_FORMAT_FP16)
-    BADGE_FAIL("DXGI: back buffer format %d (needs %d, R16G16B16A16_FLOAT)", desc.BufferDesc.Format,
-               DXGI_FORMAT_FP16);
-  if (last_present_hr != S_OK)
-    BADGE_FAIL("DXGI: last Present returned 0x%08lx", (unsigned long)last_present_hr);
-  /* 3. DXMT and 4. macOS */
-  struct sc6_dxmt_status st;
-  memset(&st, 0, sizeof(st));
-  if (!badge_dxmt_status || badge_dxmt_status(&st, sizeof(st)) != sizeof(st) || st.size != sizeof(st)) {
-    BADGE_FAIL("DXMT: no present status (needs the SC6 DXMT build)");
-    badge_have_baseline = 0;
-  } else {
-    if (st.colorspace != WMT_COLORSPACE_SCRGB)
-      BADGE_FAIL("DXMT: layer color space %u (needs %d, scRGB)", st.colorspace, WMT_COLORSPACE_SCRGB);
-    if (!st.colorspace_ok)
-      BADGE_FAIL("DXMT: setting the layer color space failed");
-    if (st.source_format != WMT_PIXEL_FORMAT_RGBA16F)
-      BADGE_FAIL("DXMT: back buffer pixel format %u (needs %d)", st.source_format, WMT_PIXEL_FORMAT_RGBA16F);
-    if (st.layer_pixel_format != WMT_PIXEL_FORMAT_RGBA16F)
-      BADGE_FAIL("DXMT: layer pixel format %u (needs %d, RGBA16Float)", st.layer_pixel_format,
-                 WMT_PIXEL_FORMAT_RGBA16F);
-    if (badge_have_baseline && st.drawable_failures != badge_last_failures)
-      BADGE_FAIL("DXMT: %llu presents got no drawable", (unsigned long long)(st.drawable_failures - badge_last_failures));
-    if (!badge_have_baseline || st.drawables == badge_last_drawables)
-      BADGE_FAIL("DXMT: no presented frames since the last check");
-    badge_last_failures = st.drawable_failures;
-    badge_last_drawables = st.drawables;
-    badge_have_baseline = 1;
-    if (st.edr_current < badge_min_headroom)
-      BADGE_FAIL("macOS: EDR headroom %.3f (needs %.2f; potential %.3f)", st.edr_current, badge_min_headroom,
-                 st.edr_potential);
-    else if (st.edr_potential < st.edr_current)
-      BADGE_FAIL("macOS: EDR headroom %.3f is above potential %.3f", st.edr_current, st.edr_potential);
-    else if (st.edr_current > badge_last_current * 1.02f || st.edr_current < badge_last_current * 0.98f)
-      BADGE_FAIL("macOS: EDR headroom is changing (%.3f, was %.3f; potential %.3f)", st.edr_current,
-                 badge_last_current, st.edr_potential);
-    badge_last_current = st.edr_current;
-    badge_peak = st.edr_potential;
-  }
-  /* 5. BetterDisplay */
-  if (bd_enabled) {
-    AcquireSRWLockShared(&bd_lock);
-    int ok = bd_ok;
-    ULONGLONG age = GetTickCount64() - bd_time;
-    char r[160];
-    memcpy(r, bd_reason, sizeof(r));
-    ReleaseSRWLockShared(&bd_lock);
-    if (!ok)
-      BADGE_FAIL("%s", r);
-    else if (age > 6000)
-      BADGE_FAIL("BetterDisplay: last answer is %llu ms old", (unsigned long long)age);
-  }
-  if (!used)
-    snprintf(reason, reason_size, "all checks pass: headroom %.2f, potential %.2f%s%s", st.edr_current,
-             st.edr_potential, bd_enabled ? ", BetterDisplay " : "", bd_enabled ? bd_reason : "");
-  return used == 0;
-}
-
-static uint16_t badge_half(float f) {
-  union {
-    float f;
-    uint32_t u;
-  } x = {f};
-  int e = (int)((x.u >> 23) & 0xff) - 127 + 15;
-  if (f <= 0.0f || e <= 0)
-    return 0;
-  if (e >= 31)
-    return 0x7bff; /* the largest finite half */
-  return (uint16_t)((e << 10) | ((x.u & 0x7fffff) >> 13));
-}
-
-/* 5x7 pixel letters "H", "D", "R"; bit 4 is the left column. */
-static const uint8_t badge_font[3][7] = {
-    {0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11},
-    {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e},
-    {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11},
-};
-
-/* Fills the badge pixels: black box, text at scRGB value v. */
-static void badge_pixels(uint16_t *px, float v) {
-  uint16_t text = badge_half(v), one = badge_half(1.0f);
-  for (UINT y = 0; y < badge_h; y++)
-    for (UINT x = 0; x < badge_w; x++) {
-      uint16_t *p = px + ((size_t)y * badge_w + x) * 4;
-      int cx = (int)(x / badge_scale) - 2, cy = (int)(y / badge_scale) - 2; /* 2-cell margin */
-      int letter = cx / 6, col = cx % 6, lit = 0;
-      if (cx >= 0 && cy >= 0 && cy < 7 && letter < 3 && col < 5)
-        lit = (badge_font[letter][cy] >> (4 - col)) & 1;
-      p[0] = p[1] = p[2] = lit ? text : 0;
-      p[3] = one;
-    }
-}
-
-static void hdr_badge_present(void *swapchain) {
-  if (!cfg_hdr_badge || !swapchain)
-    return;
-  IDXGISwapChain *sc = (IDXGISwapChain *)swapchain;
-  if (badge_frame++ % HDR_BADGE_CHECK_FRAMES == 0) {
-    char reason[512];
-    badge_show = badge_check(sc, reason, sizeof(reason));
-    if (strcmp(reason, badge_last_reason)) {
-      /* Log changes only; the headroom numbers change often, so compare the
-       * text without them for the "shown" state. */
-      if (!badge_show || strncmp(badge_last_reason, "all checks pass", 15))
-        log_msg("hdr badge: %s: %s", badge_show ? "shown" : "hidden", reason);
-      snprintf(badge_last_reason, sizeof(badge_last_reason), "%s", reason);
-    }
-  }
-  if (!badge_show)
-    return;
-  ID3D11Texture2D *bb = NULL;
-  if (FAILED(sc->lpVtbl->GetBuffer(sc, 0, &sc6_IID_ID3D11Texture2D, (void **)&bb)) || !bb)
-    return;
-  D3D11_TEXTURE2D_DESC bd;
-  bb->lpVtbl->GetDesc(bb, &bd);
-  ID3D11Device *dev = NULL;
-  ID3D11DeviceContext *ctx = NULL;
-  bb->lpVtbl->GetDevice(bb, &dev);
-  if (dev)
-    dev->lpVtbl->GetImmediateContext(dev, &ctx);
-  /* The text value that DXMT shows at the screen's current peak: DXMT
-   * multiplies scRGB by 0.8 * current / potential, so potential / 0.8
-   * lands exactly at the current headroom. */
-  float v = badge_peak / 0.8f;
-  if (ctx && bd.Format == DXGI_FORMAT_FP16) {
-    if (!badge_tex || badge_for_height != bd.Height) {
-      if (badge_tex)
-        badge_tex->lpVtbl->Release(badge_tex);
-      badge_tex = NULL;
-      badge_scale = bd.Height / 280 > 2 ? bd.Height / 280 : 2;
-      badge_w = (2 + 17 + 2) * badge_scale; /* margin, 3 letters of 5 with 1-cell gaps, margin */
-      badge_h = (2 + 7 + 2) * badge_scale;
-      badge_for_height = bd.Height;
-      uint16_t *px = malloc((size_t)badge_w * badge_h * 8);
-      if (px && badge_w + 16 < bd.Width && badge_h + 16 < bd.Height) {
-        badge_pixels(px, v);
-        D3D11_TEXTURE2D_DESC td = {badge_w, badge_h, 1, 1, DXGI_FORMAT_FP16, {1, 0}, D3D11_USAGE_DEFAULT,
-                                   D3D11_BIND_SHADER_RESOURCE, 0, 0};
-        D3D11_SUBRESOURCE_DATA init = {px, badge_w * 8, 0};
-        if (FAILED(dev->lpVtbl->CreateTexture2D(dev, &td, &init, &badge_tex)))
-          badge_tex = NULL;
-        badge_tex_value = v;
-      }
-      free(px);
-    } else if (v > badge_tex_value * 1.02f || v < badge_tex_value * 0.98f) {
-      uint16_t *px = malloc((size_t)badge_w * badge_h * 8);
-      if (px) {
-        badge_pixels(px, v);
-        ctx->lpVtbl->UpdateSubresource(ctx, (ID3D11Resource *)badge_tex, 0, NULL, px, badge_w * 8, 0);
-        badge_tex_value = v;
-        free(px);
-      }
-    }
-    if (badge_tex) {
-      UINT margin = badge_scale * 4;
-      ctx->lpVtbl->CopySubresourceRegion(ctx, (ID3D11Resource *)bb, 0, bd.Width - badge_w - margin,
-                                         bd.Height - badge_h - margin, 0, (ID3D11Resource *)badge_tex, 0, NULL);
-    }
-  }
-  if (ctx)
-    ctx->lpVtbl->Release(ctx);
-  if (dev)
-    dev->lpVtbl->Release(dev);
-  bb->lpVtbl->Release(bb);
 }
 
 /* ---------- setup -------------------------------------------------------- */
@@ -4992,8 +4587,6 @@ static void setup(void) {
     install_query_wait();
   if (env_int("SC6VRR_HDR", 0))
     install_hdr();
-  if (env_int("SC6VRR_HDR_BADGE", 0))
-    hdr_badge_setup();
   /* Shader capture hooks only d3d11.dll exports, so it does not depend on the
    * engine prologue checks below and enables its own hooks. */
   char dir[MAX_PATH];
@@ -5009,16 +4602,6 @@ static void setup(void) {
              !install_frame_log((void *)GetProcAddress(dxgi, "CreateDXGIFactory"),
                                 (void *)GetProcAddress(dxgi, "CreateDXGIFactory1")))
       log_msg("frames: frame log disabled (dxgi %p)", (void *)dxgi);
-  }
-  /* The HDR watermark draws at Present, so it needs the Present hook even
-   * without SC6VRR_SHADER_DIR. */
-  if (cfg_hdr_badge && !frame_log_installed) {
-    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
-    if (!dxgi || !install_frame_log((void *)GetProcAddress(dxgi, "CreateDXGIFactory"),
-                                    (void *)GetProcAddress(dxgi, "CreateDXGIFactory1"))) {
-      log_msg("hdr badge: no Present hook (dxgi %p); watermark off", (void *)dxgi);
-      cfg_hdr_badge = 0;
-    }
   }
   gpu_pass_setup();
   cfg_skip_prepass = env_int("SC6VRR_SKIP_PREPASS", 0);
