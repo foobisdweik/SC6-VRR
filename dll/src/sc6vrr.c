@@ -646,6 +646,13 @@ static const gate_site kGates[] = {
   {"Site22 Chara_TickActor",                0x1403D0590, "4055535641544155488dac24", 0},
   {"Site22b DemoHuman_TickActor",           0x1404865B0, "488bc45556488d68a14881ec", 0},
   {"MoveVM_GetTimeDilationScalar",          0x14030A8C0, "0fb6913c0200004c8d0d02ba", 1},
+  /* Not a HorseMod gate. The training input display's history pusher
+   * (ALuxInputKeyEventListener; adds an entry when a step's "pressed" bits
+   * are set) runs from the listener's own tick on every engine frame. The
+   * step's bits stay set until the next step, so without this gate each
+   * press appears twice in the display. Display only: the battle itself
+   * reads each step's input once. */
+  {"Site23 KeyListener_PushInputHistory",   0x1403FDCE0, "40574883ec30488bf9e8", 0},
 };
 
 /* Master-clock increments: `inc dword [rbx+0x3A4]` (FF 83 A4 03 00 00). */
@@ -1026,7 +1033,7 @@ static struct {
 } input_stats;
 
 /* SC6VRR_INPUT_TRACE=1 logs, during battles only, how a button word travels
- * from the pad to the battle (for the single-press-reads-as-double-tap bug):
+ * from the pad to the battle (written to check that one press arrives once):
  *  "trace X": XInput's buttons changed (D-pad = bits 0x000F).
  *  "trace W": the input log's cache writer (vtable slot 0x608,
  *     0x1403f2b60) stores the local input words (+0x3B8, +0x3BC) for one
@@ -5002,10 +5009,11 @@ static FARPROC real_proc(const char *name) {
 /* SC6VRR_HIDE_DINPUT_PADS=1 hides game controllers from DirectInput.
  * SC6 reads pads through XInput and through DirectInput. On Windows it skips
  * a DirectInput device that is also an XInput pad, but under Wine that check
- * can miss, and then one press could arrive twice. (The doubled input seen
- * 2026-11-01 is NOT display-only: in battle, one D-pad press acts as a double
- * tap, giving a dash or a quickstep. Its cause is open; see
- * SC6VRR_INPUT_TRACE.) With the option on, IDirectInput8::EnumDevices (vtable slot 4,
+ * can miss, and then one press could arrive twice. (Neither effect seen
+ * 2026-11-01 comes from that: the doubled training input display came from
+ * SC6VRR_GATE and is fixed by the Site23 gate, and a run or side step on one
+ * D-pad press is SC6's normal movement: hold = 8-way run, tap 2 or 8 = side
+ * step.) With the option on, IDirectInput8::EnumDevices (vtable slot 4,
  * shared by every instance) drops joystick, gamepad, driving, flight and
  * first-person devices, so the pad reaches the game only through XInput.
  * Every EnumDevices call that sees a different device list is logged. */
