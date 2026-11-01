@@ -1016,6 +1016,73 @@ static struct {
   unsigned reads, before_world, in_world, after_world, other_thread, presses, latched, early, world_ticks, buttons, on_step, not_due;
 } input_stats;
 
+/* SC6VRR_INPUT_TRACE=1 logs, during battles only, how a button word travels
+ * from the pad to the battle (for the single-press-reads-as-double-tap bug):
+ *  "trace X": XInput's buttons changed (D-pad = bits 0x000F).
+ *  "trace W": the input log's cache writer (vtable slot 0x608,
+ *     0x1403f2b60) stores the local input words (+0x3B8, +0x3BC) for one
+ *     frame of the master clock. The entry for a frame is written only once:
+ *     "already-filled" means this call changes nothing.
+ *  "trace R": a battle step reads one word (0x1403f0720). It returns 0
+ *     (neutral) unless the entry holds the frame it asks for.
+ * Every line carries the engine frame (f) and whether that frame runs a
+ * battle step. Off by default; at most TRACE_MAX_LINES lines per run. */
+#define ADDR_CACHE_WRITE 0x1403f2b60ull
+#define ADDR_CACHE_READ 0x1403f0720ull
+#define TRACE_MAX_LINES 20000
+static int cfg_input_trace;
+static volatile LONG trace_lines;
+static int trace_active(void) { return cfg_input_trace && input_in_battle && trace_lines < TRACE_MAX_LINES; }
+#define input_trace(...)                                                                                   \
+  do {                                                                                                     \
+    if (trace_active()) {                                                                                  \
+      if (InterlockedIncrement(&trace_lines) == TRACE_MAX_LINES)                                           \
+        log_msg("trace: %d lines; tracing stops", TRACE_MAX_LINES);                                        \
+      log_msg(__VA_ARGS__);                                                                                \
+    }                                                                                                      \
+  } while (0)
+
+typedef void (*cache_write_fn)(uint8_t *input_log);
+typedef uint32_t (*cache_read_fn)(uint8_t *input_log, uint32_t slot, int frame_id, uint32_t frame);
+static cache_write_fn orig_cache_write;
+static cache_read_fn orig_cache_read;
+
+static void hook_cache_write(uint8_t *log) {
+  if (trace_active()) {
+    int clock = *(int *)(log + 0x3a4), id = *(int *)(log + 0x3a0);
+    int frame = log[0x4404] ? *(int *)(log + 0x4410) : clock; /* the frame that the writer fills */
+    const uint8_t *e = log + 0x3c0 + (size_t)((unsigned)frame & 0x1ff) * 16; /* slot 0 */
+    int filled = *(const int *)e == id && *(const int *)(e + 4) == frame && e[0xc];
+    input_trace("trace W f=%lld step=%d clock=%d guard=%d frame=%d w0=%08x w1=%08x %s", (long long)g_frames,
+                !g_skip_battle, clock, log[0x4404], frame, *(uint32_t *)(log + 0x3b8), *(uint32_t *)(log + 0x3bc),
+                filled ? "already-filled" : "new");
+  }
+  orig_cache_write(log);
+}
+
+static uint32_t hook_cache_read(uint8_t *log, uint32_t slot, int frame_id, uint32_t frame) {
+  uint32_t v = orig_cache_read(log, slot, frame_id, frame);
+  if (slot < 2 && trace_active()) {
+    const uint8_t *e = log + 0x3c0 + ((size_t)(frame & 0x1ff) + (size_t)slot * 0x200) * 16;
+    input_trace("trace R f=%lld step=%d clock=%d slot=%u want=%u got=%08x entry_frame=%d entry_id_ok=%d filled=%d",
+                (long long)g_frames, !g_skip_battle, *(int *)(log + 0x3a4), slot, frame, v, *(const int *)(e + 4),
+                *(const int *)e == frame_id, e[0xc]);
+  }
+  return v;
+}
+
+static void install_input_trace(void) {
+  if (!bytes_match(ADDR(ADDR_CACHE_WRITE), "4883ec2880b90444000000") ||
+      !bytes_match(ADDR(ADDR_CACHE_READ), "48895c240848896c2410")) {
+    log_msg("trace: input cache prologue mismatch; SC6VRR_INPUT_TRACE off");
+    cfg_input_trace = 0;
+    return;
+  }
+  MH_STATUS a = MH_CreateHook(ADDR(ADDR_CACHE_WRITE), hook_cache_write, (void **)&orig_cache_write);
+  MH_STATUS b = MH_CreateHook(ADDR(ADDR_CACHE_READ), hook_cache_read, (void **)&orig_cache_read);
+  log_msg("trace: input cache writer hook %d, reader hook %d; lines start with \"trace\" during battles", a, b);
+}
+
 /* Runs in place of the exe's import of XInputGetState (XINPUT1_3 ordinal 2). */
 static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
   DWORD r = orig_xinput_get_state(user, st);
@@ -1039,6 +1106,9 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
   if (st->right_trigger > XI_TRIGGER_DOWN)
     b |= XI_RT;
   WORD down = b & ~xi_last[user];
+  if (b != xi_last[user])
+    input_trace("trace X f=%lld step=%d pad=%lu buttons=%04x", (long long)g_frames, !g_skip_battle,
+                (unsigned long)user, b);
   xi_last[user] = b;
   if (down)
     input_stats.presses++;
@@ -4868,10 +4938,14 @@ static void setup(void) {
   }
   cfg_input_latch = env_int("SC6VRR_INPUT_LATCH", 0);
   cfg_early_step = env_int("SC6VRR_EARLY_STEP", 0);
+  cfg_input_trace = env_int("SC6VRR_INPUT_TRACE", 0);
   if ((cfg_input_latch || cfg_early_step) && !cfg_gate) {
     log_msg("input: SC6VRR_INPUT_LATCH and SC6VRR_EARLY_STEP need SC6VRR_GATE=1; both off");
     cfg_input_latch = cfg_early_step = 0;
-  } else if (cfg_input_latch || cfg_early_step) {
+  }
+  if (cfg_input_trace)
+    install_input_trace();
+  if (cfg_input_latch || cfg_early_step || cfg_input_trace) {
     /* The early step must know where each pad read falls in the frame, so it
      * needs the UWorld::Tick hook, which measurement may already have made. */
     int world_hooked = orig_world_tick != NULL;
