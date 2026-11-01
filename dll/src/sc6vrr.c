@@ -4978,9 +4978,10 @@ static FARPROC real_proc(const char *name) {
 /* SC6VRR_HIDE_DINPUT_PADS=1 hides game controllers from DirectInput.
  * SC6 reads pads through XInput and through DirectInput. On Windows it skips
  * a DirectInput device that is also an XInput pad, but under Wine that check
- * can miss, and then one press could arrive twice. (Not the cause of the
- * doubled training key display seen 2026-11-01: that came from SC6VRR_GATE
- * and is display-only.) With the option on, IDirectInput8::EnumDevices (vtable slot 4,
+ * can miss, and then one press could arrive twice. (The doubled input seen
+ * 2026-11-01 is NOT display-only: in battle, one D-pad press acts as a double
+ * tap, giving a dash or a quickstep. Its cause is open; see
+ * SC6VRR_INPUT_TRACE.) With the option on, IDirectInput8::EnumDevices (vtable slot 4,
  * shared by every instance) drops joystick, gamepad, driving, flight and
  * first-person devices, so the pad reaches the game only through XInput.
  * Every EnumDevices call that sees a different device list is logged. */
